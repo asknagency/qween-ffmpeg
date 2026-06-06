@@ -1,0 +1,35 @@
+# Node
+node_modules/
+.next/
+.turbo/
+dist/
+build/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+
+# Playwright
+/apps/api/.playwright/
+
+# Temp / uploads
+/tmp/
+*.mp4
+*.zip
+!apps/**/*.zip
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.local
+.env.production

@@ -1,0 +1,14 @@
+{
+  "name": "qween-ffmpeg",
+  "private": true,
+  "workspaces": ["apps/web"],
+  "scripts": {
+    "dev": "concurrently \"npm run dev:api\" \"npm run dev:web\"",
+    "dev:api": "cd apps/api && uvicorn main:app --reload --port 8000",
+    "dev:web": "cd apps/web && npm run dev",
+    "install:all": "npm install && cd apps/web && npm install && cd ../api && pip install -r requirements.txt"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
