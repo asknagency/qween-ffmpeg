@@ -166,7 +166,8 @@ def process_video_to_format(
         args += ["-vf", vf]
 
     args += [str(output_path)]
-    return run_ffmpeg(args)
+    code, _, err = run_ffmpeg(args)
+    return code, err
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
