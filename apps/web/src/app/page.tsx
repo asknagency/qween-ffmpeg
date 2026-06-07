@@ -1,306 +1,155 @@
 'use client'
 import { useState } from 'react'
-import DropZone from '@/components/DropZone'
-import FramePreview from '@/components/FramePreview'
-import SettingsPanel, { Settings } from '@/components/SettingsPanel'
-import { uploadZip, stitch, segment, deleteJob, downloadUrl, segmentDownloadUrl, UploadResult, StitchResult, SegmentResult } from '@/lib/api'
+import StitchTool  from '@/tools/StitchTool'
+import CropTool    from '@/tools/CropTool'
+import TrimTool    from '@/tools/TrimTool'
+import ScaleTool   from '@/tools/ScaleTool'
+import SegmentTool from '@/tools/SegmentTool'
 
-type Stage = 'idle' | 'uploading' | 'ready' | 'stitching' | 'done' | 'segmenting'
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
 
-const DEFAULT_SETTINGS: Settings = {
-  fps: 30, crf: 18, width: '', height: '', preset: 'medium',
-  trim_start: '', trim_end: '',
-  crop_x: '', crop_y: '', crop_w: '', crop_h: '',
-  segment_duration: '5',
-}
+// ── Tab definitions ───────────────────────────────────────────────────────────
+const TABS = [
+  {
+    id: 'stitch',
+    label: 'Stitch',
+    emoji: '▶',
+    desc: 'Frames → MP4',
+    icon: (
+      <svg width="22" height="22" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.8">
+        <polygon points="5 3 19 12 5 21 5 3"/>
+      </svg>
+    ),
+  },
+  {
+    id: 'crop',
+    label: 'Crop',
+    emoji: '✂',
+    desc: 'Crop region',
+    icon: (
+      <svg width="22" height="22" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.8">
+        <polyline points="6 2 6 6 2 6"/><polyline points="18 22 18 18 22 18"/>
+        <rect x="6" y="6" width="12" height="12" rx="1"/>
+      </svg>
+    ),
+  },
+  {
+    id: 'trim',
+    label: 'Trim',
+    emoji: '✂',
+    desc: 'Cut start/end',
+    icon: (
+      <svg width="22" height="22" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.8">
+        <circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/>
+        <line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/>
+        <line x1="8.12" y1="8.12" x2="12" y2="12"/>
+      </svg>
+    ),
+  },
+  {
+    id: 'scale',
+    label: 'Scale',
+    emoji: '⤢',
+    desc: 'Resize output',
+    icon: (
+      <svg width="22" height="22" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.8">
+        <polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/>
+        <line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/>
+      </svg>
+    ),
+  },
+  {
+    id: 'segment',
+    label: 'Segment',
+    emoji: '⊞',
+    desc: 'Split chunks',
+    icon: (
+      <svg width="22" height="22" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.8">
+        <rect x="2" y="3" width="20" height="14" rx="2"/>
+        <line x1="8" y1="3" x2="8" y2="17"/><line x1="16" y1="3" x2="16" y2="17"/>
+        <line x1="2" y1="10" x2="22" y2="10"/>
+      </svg>
+    ),
+  },
+] as const
 
-function Badge({ children, color = 'accent' }: { children: React.ReactNode; color?: string }) {
-  const colors: Record<string, string> = {
-    accent: 'bg-accent/10 text-accent border-accent/20',
-    green: 'bg-green/10 text-green border-green/20',
-    red: 'bg-red/10 text-red border-red/20',
-  }
-  return (
-    <span className={`text-[10px] font-mono font-semibold px-2 py-0.5 rounded-full border ${colors[color]}`}>
-      {children}
-    </span>
-  )
-}
+type TabId = (typeof TABS)[number]['id']
 
-function Btn({ onClick, disabled, loading, children, variant = 'primary' }: {
-  onClick: () => void; disabled?: boolean; loading?: boolean
-  children: React.ReactNode; variant?: 'primary' | 'ghost' | 'danger'
-}) {
-  const base = 'inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all duration-150 disabled:opacity-40 disabled:cursor-not-allowed'
-  const variants = {
-    primary: 'bg-accent hover:bg-accent/80 text-white',
-    ghost: 'bg-transparent border border-border hover:border-accent/50 text-sub hover:text-text',
-    danger: 'bg-transparent border border-red/40 hover:border-red text-red/70 hover:text-red',
-  }
-  return (
-    <button onClick={onClick} disabled={disabled || loading} className={`${base} ${variants[variant]}`}>
-      {loading && <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />}
-      {children}
-    </button>
-  )
-}
-
-function LogBox({ lines }: { lines: string[] }) {
-  if (!lines.length) return null
-  return (
-    <div className="bg-bg border border-border rounded-xl p-3 font-mono text-xs text-sub max-h-40 overflow-y-auto">
-      {lines.map((l, i) => (
-        <div key={i} className="leading-5">
-          <span className="text-muted mr-2">›</span>{l}
-        </div>
-      ))}
-    </div>
-  )
-}
-
+// ── App shell ─────────────────────────────────────────────────────────────────
 export default function Home() {
-  const [stage, setStage] = useState<Stage>('idle')
-  const [upload, setUpload] = useState<UploadResult | null>(null)
-  const [stitchResult, setStitchResult] = useState<StitchResult | null>(null)
-  const [segResult, setSegResult] = useState<SegmentResult | null>(null)
-  const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS)
-  const [log, setLog] = useState<string[]>([])
-  const [error, setError] = useState('')
-
-  const addLog = (msg: string) => setLog(prev => [...prev, msg])
-  const fail = (e: unknown) => {
-    const msg = e instanceof Error ? e.message : String(e)
-    setError(msg); addLog('✗ ' + msg)
-  }
-
-  // ── Upload ────────────────────────────────────────────────────────────────
-  const handleFile = async (file: File) => {
-    setStage('uploading'); setError(''); setLog([])
-    setStitchResult(null); setSegResult(null)
-    addLog(`Uploading ${file.name} (${(file.size / 1e6).toFixed(1)} MB)…`)
-    try {
-      const result = await uploadZip(file)
-      setUpload(result)
-      addLog(`✓ ${result.frame_count} frames extracted · ${result.width}×${result.height}`)
-      setStage('ready')
-    } catch (e) { fail(e); setStage('idle') }
-  }
-
-  // ── Stitch ────────────────────────────────────────────────────────────────
-  const handleStitch = async () => {
-    if (!upload) return
-    setStage('stitching'); setError('')
-    addLog(`Stitching ${upload.frame_count} frames @ ${settings.fps} fps, CRF ${settings.crf}…`)
-    try {
-      const result = await stitch(upload.job_id, {
-        fps: settings.fps,
-        crf: settings.crf,
-        preset: settings.preset,
-        width: settings.width ? Number(settings.width) : undefined,
-        height: settings.height ? Number(settings.height) : undefined,
-        trim_start: settings.trim_start ? Number(settings.trim_start) : undefined,
-        trim_end: settings.trim_end ? Number(settings.trim_end) : undefined,
-        crop_x: settings.crop_x ? Number(settings.crop_x) : undefined,
-        crop_y: settings.crop_y ? Number(settings.crop_y) : undefined,
-        crop_w: settings.crop_w ? Number(settings.crop_w) : undefined,
-        crop_h: settings.crop_h ? Number(settings.crop_h) : undefined,
-      })
-      setStitchResult(result)
-      addLog(`✓ Done — ${result.size_mb} MB`)
-      setStage('done')
-    } catch (e) { fail(e); setStage('ready') }
-  }
-
-  // ── Segment ───────────────────────────────────────────────────────────────
-  const handleSegment = async () => {
-    if (!upload) return
-    setStage('segmenting'); setError('')
-    const dur = Number(settings.segment_duration) || 5
-    addLog(`Segmenting into ${dur}s chunks…`)
-    try {
-      const result = await segment(upload.job_id, dur)
-      setSegResult(result)
-      addLog(`✓ ${result.segment_count} segments created`)
-      setStage('done')
-    } catch (e) { fail(e); setStage('done') }
-  }
-
-  // ── Reset ─────────────────────────────────────────────────────────────────
-  const handleReset = async () => {
-    if (upload) await deleteJob(upload.job_id).catch(() => {})
-    setStage('idle'); setUpload(null); setStitchResult(null)
-    setSegResult(null); setLog([]); setError(''); setSettings(DEFAULT_SETTINGS)
-  }
-
-  const busy = stage === 'uploading' || stage === 'stitching' || stage === 'segmenting'
+  const [active, setActive] = useState<TabId>('stitch')
+  const current = TABS.find(t => t.id === active)!
 
   return (
-    <div className="min-h-screen bg-bg">
-      {/* ── Top bar ── */}
-      <header className="border-b border-border px-6 py-3 flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <div className="w-7 h-7 rounded-lg bg-accent/20 border border-accent/30 flex items-center justify-center">
+    <div style={{ height: '100dvh', display: 'flex', flexDirection: 'column', background: '#0d0d0f' }}>
+
+      {/* ── Header ── */}
+      <header style={{
+        height: 52, background: '#111116', borderBottom: '1px solid #1e1e28',
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        padding: '0 16px', flexShrink: 0,
+        paddingTop: 'env(safe-area-inset-top)',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{
+            width: 28, height: 28, borderRadius: 8,
+            background: 'rgba(124,109,250,0.15)', border: '1px solid rgba(124,109,250,0.3)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}>
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-              <path d="M15 10L19.553 7.724A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M3 8a2 2 0 012-2h10a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z" stroke="#7c6dfa" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
+              <path d="M15 10L19.553 7.724A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M3 8a2 2 0 012-2h10a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z"
+                stroke="#7c6dfa" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
             </svg>
           </div>
-          <span className="font-mono font-semibold text-text text-sm tracking-tight">QweenFFmpeg</span>
-          <Badge>v1.0</Badge>
+          <span style={{ fontSize: 14, fontWeight: 700, color: '#e8e8f0', letterSpacing: '-0.02em', fontFamily: 'JetBrains Mono, monospace' }}>
+            QweenFFmpeg
+          </span>
         </div>
-        {upload && (
-          <button onClick={handleReset} className="text-xs font-mono text-muted hover:text-red transition-colors">
-            ✕ reset
-          </button>
-        )}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ fontSize: 10, fontFamily: 'monospace', color: '#555566',
+            background: '#1a1a24', border: '1px solid #2a2a38', borderRadius: 6, padding: '3px 8px' }}>
+            {current.desc}
+          </span>
+        </div>
       </header>
 
-      <main className="max-w-6xl mx-auto px-6 py-8 grid grid-cols-1 lg:grid-cols-[1fr_340px] gap-6">
+      {/* ── Horizontal tab scroll bar ── */}
+      <div style={{
+        background: '#111116', borderBottom: '1px solid #1e1e28',
+        display: 'flex', overflowX: 'auto', flexShrink: 0,
+        scrollbarWidth: 'none', WebkitOverflowScrolling: 'touch',
+      }}>
+        {TABS.map(tab => (
+          <button key={tab.id} onClick={() => setActive(tab.id)}
+            style={{
+              flex: '0 0 auto', display: 'flex', flexDirection: 'column',
+              alignItems: 'center', justifyContent: 'center',
+              gap: 2, padding: '10px 20px', cursor: 'pointer',
+              background: 'none', border: 'none',
+              borderBottom: active === tab.id ? '2px solid #7c6dfa' : '2px solid transparent',
+              color: active === tab.id ? '#7c6dfa' : '#55556a',
+              transition: 'color 0.15s',
+              WebkitTapHighlightColor: 'transparent',
+              userSelect: 'none',
+            }}>
+            <span style={{ fontSize: 11, fontWeight: 700, fontFamily: 'JetBrains Mono, monospace',
+              letterSpacing: '0.04em', textTransform: 'uppercase' }}>
+              {tab.label}
+            </span>
+          </button>
+        ))}
+      </div>
 
-        {/* ── Left col ── */}
-        <div className="flex flex-col gap-5">
+      {/* ── Scrollable tool content ── */}
+      <div style={{ flex: 1, overflowY: 'auto', padding: '16px 16px 24px',
+        paddingBottom: 'calc(16px + env(safe-area-inset-bottom))' }}>
+        {active === 'stitch'  && <StitchTool  apiBase={API_BASE} />}
+        {active === 'crop'    && <CropTool    apiBase={API_BASE} />}
+        {active === 'trim'    && <TrimTool    apiBase={API_BASE} />}
+        {active === 'scale'   && <ScaleTool   apiBase={API_BASE} />}
+        {active === 'segment' && <SegmentTool apiBase={API_BASE} />}
+      </div>
 
-          {/* Upload */}
-          {stage === 'idle' && (
-            <DropZone onFile={handleFile} loading={busy} />
-          )}
-
-          {/* Uploading spinner */}
-          {stage === 'uploading' && (
-            <div className="border border-border rounded-xl p-10 flex flex-col items-center gap-3">
-              <div className="w-8 h-8 border-2 border-accent/30 border-t-accent rounded-full animate-spin" />
-              <p className="text-sub text-sm font-mono">Extracting frames…</p>
-            </div>
-          )}
-
-          {/* Frame preview */}
-          {upload && stage !== 'idle' && (
-            <FramePreview
-              jobId={upload.job_id}
-              frameCount={upload.frame_count}
-              width={upload.width}
-              height={upload.height}
-            />
-          )}
-
-          {/* Log */}
-          <LogBox lines={log} />
-
-          {/* Error */}
-          {error && (
-            <div className="bg-red/5 border border-red/20 rounded-xl px-4 py-3 text-xs font-mono text-red">
-              {error}
-            </div>
-          )}
-
-          {/* Output card */}
-          {stitchResult && (
-            <div className="bg-panel border border-green/20 rounded-xl overflow-hidden">
-              <div className="flex items-center justify-between px-4 py-3 border-b border-border">
-                <div className="flex items-center gap-2">
-                  <div className="w-2 h-2 rounded-full bg-green animate-pulse" />
-                  <span className="text-sm font-medium text-text">Output ready</span>
-                </div>
-                <Badge color="green">{stitchResult.size_mb} MB</Badge>
-              </div>
-              <div className="p-4 flex flex-wrap gap-3">
-                <a
-                  href={downloadUrl(upload!.job_id)}
-                  download
-                  className="inline-flex items-center gap-2 px-4 py-2 bg-green/10 border border-green/30 text-green rounded-lg text-sm font-medium hover:bg-green/20 transition-colors"
-                >
-                  ↓ Download MP4
-                </a>
-                <Btn onClick={handleSegment} loading={stage === 'segmenting'} variant="ghost">
-                  ✂ Segment video
-                </Btn>
-              </div>
-            </div>
-          )}
-
-          {/* Segments */}
-          {segResult && (
-            <div className="bg-panel border border-border rounded-xl overflow-hidden">
-              <div className="px-4 py-3 border-b border-border flex items-center gap-2">
-                <span className="text-sm font-medium text-text">Segments</span>
-                <Badge>{segResult.segment_count} parts</Badge>
-              </div>
-              <div className="p-3 flex flex-col gap-1.5 max-h-60 overflow-y-auto">
-                {segResult.segments.map(seg => (
-                  <a
-                    key={seg.index}
-                    href={segmentDownloadUrl(upload!.job_id, seg.index)}
-                    download
-                    className="flex items-center justify-between px-3 py-2 rounded-lg bg-bg border border-border hover:border-accent/40 transition-colors group"
-                  >
-                    <span className="text-xs font-mono text-sub group-hover:text-text">{seg.filename}</span>
-                    <div className="flex items-center gap-3">
-                      <span className="text-xs font-mono text-muted">{seg.size_mb} MB</span>
-                      <span className="text-accent text-xs">↓</span>
-                    </div>
-                  </a>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-
-        {/* ── Right col: settings ── */}
-        <div className="flex flex-col gap-4">
-          <div className="bg-panel border border-border rounded-xl p-5 flex flex-col gap-5">
-            <div className="flex items-center justify-between">
-              <p className="text-xs font-mono font-semibold uppercase tracking-widest text-muted">Settings</p>
-              {upload && <Badge color="green">{upload.frame_count} frames</Badge>}
-            </div>
-
-            <SettingsPanel
-              settings={settings}
-              onChange={setSettings}
-              frameCount={upload?.frame_count ?? 0}
-              srcWidth={upload?.width ?? '?'}
-              srcHeight={upload?.height ?? '?'}
-            />
-
-            {upload && (
-              <div className="flex flex-col gap-2 pt-2 border-t border-border">
-                <Btn
-                  onClick={handleStitch}
-                  loading={stage === 'stitching'}
-                  disabled={busy || stage === 'uploading'}
-                >
-                  {stage === 'stitching' ? 'Stitching…' : '▶ Stitch to MP4'}
-                </Btn>
-                {stitchResult && (
-                  <Btn onClick={handleReset} variant="ghost">
-                    ↺ Start over
-                  </Btn>
-                )}
-              </div>
-            )}
-          </div>
-
-          {/* Help card */}
-          {!upload && (
-            <div className="bg-panel border border-border rounded-xl p-5">
-              <p className="text-xs font-mono font-semibold uppercase tracking-widest text-muted mb-3">How it works</p>
-              <ol className="flex flex-col gap-2.5">
-                {[
-                  'Export frames from QweenApp as a ZIP',
-                  'Drop the ZIP here — any size',
-                  'Scrub the preview to verify order',
-                  'Set FPS, quality, crop & trim',
-                  'Stitch → download MP4',
-                  'Optionally segment into chunks',
-                ].map((step, i) => (
-                  <li key={i} className="flex items-start gap-2.5 text-xs text-sub">
-                    <span className="font-mono text-accent/60 mt-0.5 shrink-0">{i + 1}.</span>
-                    {step}
-                  </li>
-                ))}
-              </ol>
-            </div>
-          )}
-        </div>
-      </main>
     </div>
   )
 }

@@ -3,26 +3,23 @@
 @tailwind components;
 @tailwind utilities;
 
-* { box-sizing: border-box; }
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+html, body, #__next { height: 100%; }
 
 body {
   background: #0d0d0f;
   color: #e8e8f0;
   font-family: 'DM Sans', sans-serif;
   -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  touch-action: manipulation;
 }
 
 ::-webkit-scrollbar { width: 4px; height: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #2a2a30; border-radius: 2px; }
 
-/* drag-drop highlight */
-.drop-active {
-  border-color: #7c6dfa !important;
-  background: rgba(124,109,250,0.06) !important;
-}
-
-/* range input */
 input[type=range] {
   -webkit-appearance: none;
   width: 100%;
@@ -33,20 +30,22 @@ input[type=range] {
 }
 input[type=range]::-webkit-slider-thumb {
   -webkit-appearance: none;
-  width: 14px; height: 14px;
+  width: 18px; height: 18px;
   border-radius: 50%;
   background: #7c6dfa;
   cursor: pointer;
   border: 2px solid #0d0d0f;
 }
 
-/* progress bar animation */
-@keyframes progress-shimmer {
+@keyframes spin { to { transform: rotate(360deg); } }
+.spin { animation: spin 0.8s linear infinite; }
+
+@keyframes shimmer {
   0%   { background-position: -200% 0; }
   100% { background-position:  200% 0; }
 }
-.progress-shimmer {
+.shimmer {
   background: linear-gradient(90deg, #4a3fa0 25%, #7c6dfa 50%, #4a3fa0 75%);
   background-size: 200% 100%;
-  animation: progress-shimmer 1.4s infinite;
+  animation: shimmer 1.4s infinite;
 }

@@ -1,4 +1,4 @@
-const BASE = '/api/ffmpeg'
+const DEFAULT_BASE = '/api/ffmpeg'
 
 export interface UploadResult {
   job_id: string
@@ -43,44 +43,44 @@ export interface StitchParams {
   crop_h?: number
 }
 
-export async function uploadZip(file: File): Promise<UploadResult> {
+export async function uploadZip(file: File, base = DEFAULT_BASE): Promise<UploadResult> {
   const fd = new FormData()
   fd.append('file', file)
-  const r = await fetch(`${BASE}/jobs/upload`, { method: 'POST', body: fd })
+  const r = await fetch(`${base}/jobs/upload`, { method: 'POST', body: fd })
   if (!r.ok) throw new Error((await r.json()).detail ?? 'Upload failed')
   return r.json()
 }
 
-export async function stitch(jobId: string, params: StitchParams): Promise<StitchResult> {
+export async function stitch(jobId: string, params: StitchParams, base = DEFAULT_BASE): Promise<StitchResult> {
   const fd = new FormData()
   Object.entries(params).forEach(([k, v]) => {
     if (v !== undefined && v !== null && v !== '') fd.append(k, String(v))
   })
-  const r = await fetch(`${BASE}/jobs/${jobId}/stitch`, { method: 'POST', body: fd })
+  const r = await fetch(`${base}/jobs/${jobId}/stitch`, { method: 'POST', body: fd })
   if (!r.ok) throw new Error((await r.json()).detail ?? 'Stitch failed')
   return r.json()
 }
 
-export async function segment(jobId: string, duration: number): Promise<SegmentResult> {
+export async function segment(jobId: string, duration: number, base = DEFAULT_BASE): Promise<SegmentResult> {
   const fd = new FormData()
   fd.append('segment_duration', String(duration))
-  const r = await fetch(`${BASE}/jobs/${jobId}/segment`, { method: 'POST', body: fd })
+  const r = await fetch(`${base}/jobs/${jobId}/segment`, { method: 'POST', body: fd })
   if (!r.ok) throw new Error((await r.json()).detail ?? 'Segment failed')
   return r.json()
 }
 
-export async function deleteJob(jobId: string) {
-  await fetch(`${BASE}/jobs/${jobId}`, { method: 'DELETE' })
+export async function deleteJob(jobId: string, base = DEFAULT_BASE) {
+  await fetch(`${base}/jobs/${jobId}`, { method: 'DELETE' })
 }
 
-export function frameUrl(jobId: string, index: number) {
-  return `${BASE}/jobs/${jobId}/frame/${index}`
+export function frameUrl(jobId: string, index: number, base = DEFAULT_BASE) {
+  return `${base}/jobs/${jobId}/frame/${index}`
 }
 
-export function downloadUrl(jobId: string) {
-  return `${BASE}/jobs/${jobId}/download`
+export function downloadUrl(jobId: string, base = DEFAULT_BASE) {
+  return `${base}/jobs/${jobId}/download`
 }
 
-export function segmentDownloadUrl(jobId: string, index: number) {
-  return `${BASE}/jobs/${jobId}/segment/${index}`
+export function segmentDownloadUrl(jobId: string, index: number, base = DEFAULT_BASE) {
+  return `${base}/jobs/${jobId}/segment/${index}`
 }
