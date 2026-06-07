@@ -73,11 +73,12 @@ def probe_video(path: Path) -> dict:
          "-of", "csv=p=0", str(path)],
         capture_output=True, text=True,
     )
-    parts = r.stdout.strip().split(",") if r.stdout.strip() else []
+    raw   = r.stdout.strip().splitlines()[0] if r.stdout.strip() else ""
+    parts = [p.strip() for p in raw.split(",")] if raw else []
     return {
         "width":    parts[0] if len(parts) > 0 else "?",
         "height":   parts[1] if len(parts) > 1 else "?",
-        "duration": parts[2] if len(parts) > 2 else "?",
+        "duration": parts[2] if len(parts) > 2 else "0",
     }
 
 
@@ -216,14 +217,15 @@ async def upload_frames(file: UploadFile = File(...)):
          str(flat_dir / f"frame_000000{img_ext}")],
         capture_output=True, text=True,
     )
-    dims = probe.stdout.strip().split(",") if probe.stdout.strip() else ["?", "?"]
+    raw  = probe.stdout.strip().splitlines()[0] if probe.stdout.strip() else ""
+    dims = raw.split(",") if raw else []
 
     return {
         "job_id":      job_id,
         "frame_count": len(all_images),
         "extension":   img_ext,
-        "width":       dims[0] if len(dims) > 0 else "?",
-        "height":      dims[1] if len(dims) > 1 else "?",
+        "width":       dims[0].strip() if len(dims) > 0 else "?",
+        "height":      dims[1].strip() if len(dims) > 1 else "?",
         "first_frame": f"/jobs/{job_id}/frame/0",
     }
 
