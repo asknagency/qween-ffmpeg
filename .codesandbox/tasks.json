@@ -10,14 +10,6 @@
       "command": "npm install -g pnpm@9.1.0"
     },
     {
-      "name": "Install web dependencies",
-      "command": "cd apps/web && pnpm install"
-    },
-    {
-      "name": "Install API dependencies",
-      "command": "cd apps/api && pip install -r requirements.txt"
-    },
-    {
       "name": "Install Playwright browser",
       "command": "cd apps/api && python -m playwright install chromium --with-deps"
     }
