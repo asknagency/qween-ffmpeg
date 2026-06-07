@@ -241,10 +241,36 @@ async def upload_video(file: UploadFile = File(...)):
         raise HTTPException(400, f"Unsupported file type. Allowed: {', '.join(allowed)}")
 
     job_id, job_dir = new_job()
+    raw_path   = job_dir / f"raw{suffix}"
     video_path = job_dir / f"input{suffix}"
 
-    async with aiofiles.open(video_path, "wb") as f:
+    async with aiofiles.open(raw_path, "wb") as f:
         f.write(await file.read())
+
+    # Remux to fix moov atom position, incomplete files, or codec issues
+    # -movflags faststart moves moov atom to front (fixes "moov atom not found")
+    code, _, err = run_ffmpeg([
+        "-i", str(raw_path),
+        "-c", "copy",
+        "-movflags", "faststart",
+        str(video_path),
+    ])
+
+    if code != 0:
+        # Fallback — try re-encoding if copy remux fails
+        code, _, err = run_ffmpeg([
+            "-i", str(raw_path),
+            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+            "-movflags", "faststart",
+            str(video_path),
+        ])
+
+    if code != 0:
+        shutil.rmtree(job_dir)
+        raise HTTPException(400, f"Could not process video file. Make sure it is a valid video.\nDetails: {err.splitlines()[-1] if err else 'unknown error'}")
+
+    # Clean up raw upload
+    raw_path.unlink(missing_ok=True)
 
     info = probe_video(video_path)
     return {
