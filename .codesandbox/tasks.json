@@ -3,7 +3,7 @@
   "setupTasks": [
     {
       "name": "Install ffmpeg + ffprobe",
-      "command": "sudo apt-get update -qq && sudo apt-get install -y ffmpeg"
+      "command": "sudo apt-get update -qq && sudo apt-get install -y ffmpeg && ffmpeg -version && ffprobe -version"
     },
     {
       "name": "Install pnpm",
@@ -16,25 +16,25 @@
   ],
   "tasks": {
     "dev:api": {
-      "name": "▶ Run API (FastAPI :8000)",
+      "name": "\u25b6 Run API (FastAPI :8000)",
       "command": "cd apps/api && uvicorn main:app --reload --port 8000 --host 0.0.0.0",
       "preview": {
         "port": 8000
       }
     },
     "dev:web": {
-      "name": "▶ Run Web (Next.js :3000)",
+      "name": "\u25b6 Run Web (Next.js :3000)",
       "command": "cd apps/web && pnpm dev",
       "preview": {
         "port": 3000
       }
     },
     "health": {
-      "name": "✓ Health check",
+      "name": "\u2713 Health check",
       "command": "curl -s http://localhost:8000/health | python3 -m json.tool"
     },
     "typecheck": {
-      "name": "✓ TypeScript check",
+      "name": "\u2713 TypeScript check",
       "command": "cd apps/web && pnpm exec tsc --noEmit"
     }
   }
