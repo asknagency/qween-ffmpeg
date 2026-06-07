@@ -277,17 +277,34 @@ async def stitch(
     crf:         int           = Form(18),
     preset:      str           = Form("medium"),
     format:      str           = Form("mp4"),
-    width:       Optional[int] = Form(None),
-    height:      Optional[int] = Form(None),
-    trim_start:  Optional[float] = Form(None),
-    trim_end:    Optional[float] = Form(None),
-    crop_x:      Optional[int] = Form(None),
-    crop_y:      Optional[int] = Form(None),
-    crop_w:      Optional[int] = Form(None),
-    crop_h:      Optional[int] = Form(None),
+    width:       Optional[str] = Form(None),
+    height:      Optional[str] = Form(None),
+    trim_start:  Optional[str] = Form(None),
+    trim_end:    Optional[str] = Form(None),
+    crop_x:      Optional[str] = Form(None),
+    crop_y:      Optional[str] = Form(None),
+    crop_w:      Optional[str] = Form(None),
+    crop_h:      Optional[str] = Form(None),
 ):
     if format not in VALID_FORMATS:
         raise HTTPException(400, f"Invalid format. Choose from: {', '.join(VALID_FORMATS)}")
+
+    def to_int(v):
+        try: return int(v) if v and str(v).strip() else None
+        except: return None
+
+    def to_float(v):
+        try: return float(v) if v and str(v).strip() else None
+        except: return None
+
+    _width      = to_int(width)
+    _height     = to_int(height)
+    _trim_start = to_float(trim_start)
+    _trim_end   = to_float(trim_end)
+    _crop_x     = to_int(crop_x)
+    _crop_y     = to_int(crop_y)
+    _crop_w     = to_int(crop_w)
+    _crop_h     = to_int(crop_h)
 
     job_dir  = WORK_DIR / job_id
     flat_dir = job_dir / "flat"
@@ -301,7 +318,7 @@ async def stitch(
     img_ext       = frames[0].suffix.lower()
     input_pattern = str(flat_dir / f"frame_%06d{img_ext}")
     output        = output_path_for(job_dir, format)
-    vf            = build_vf(crop_x, crop_y, crop_w, crop_h, width, height)
+    vf            = build_vf(_crop_x, _crop_y, _crop_w, _crop_h, _width, _height)
 
     if format == "gif":
         code, err = stitch_to_gif(input_pattern, fps, job_dir, output, vf)
@@ -336,14 +353,14 @@ async def process_video(
     format:      str           = Form("mp4"),
     crf:         int           = Form(18),
     preset:      str           = Form("medium"),
-    width:       Optional[int] = Form(None),
-    height:      Optional[int] = Form(None),
-    trim_start:  Optional[float] = Form(None),
-    trim_end:    Optional[float] = Form(None),
-    crop_x:      Optional[int] = Form(None),
-    crop_y:      Optional[int] = Form(None),
-    crop_w:      Optional[int] = Form(None),
-    crop_h:      Optional[int] = Form(None),
+    width:       Optional[str] = Form(None),
+    height:      Optional[str] = Form(None),
+    trim_start:  Optional[str] = Form(None),
+    trim_end:    Optional[str] = Form(None),
+    crop_x:      Optional[str] = Form(None),
+    crop_y:      Optional[str] = Form(None),
+    crop_w:      Optional[str] = Form(None),
+    crop_h:      Optional[str] = Form(None),
 ):
     if format not in VALID_VIDEO_FORMATS:
         raise HTTPException(400, f"Invalid format for video processing. Choose from: {', '.join(VALID_VIDEO_FORMATS)}")
@@ -351,6 +368,24 @@ async def process_video(
     job_dir = WORK_DIR / job_id
     if not job_dir.exists():
         raise HTTPException(404, "Job not found.")
+
+    # Coerce crop fields — empty string or None → None
+    def to_int(v):
+        try: return int(v) if v and str(v).strip() else None
+        except: return None
+
+    def to_float(v):
+        try: return float(v) if v and str(v).strip() else None
+        except: return None
+
+    _crop_x     = to_int(crop_x)
+    _crop_y     = to_int(crop_y)
+    _crop_w     = to_int(crop_w)
+    _crop_h     = to_int(crop_h)
+    _width      = to_int(width)
+    _height     = to_int(height)
+    _trim_start = to_float(trim_start)
+    _trim_end   = to_float(trim_end)
 
     # Find uploaded input video
     input_video = next(
@@ -361,9 +396,9 @@ async def process_video(
         raise HTTPException(404, "No input video found for this job. Use /jobs/upload-video first.")
 
     output = output_path_for(job_dir, format)
-    vf     = build_vf(crop_x, crop_y, crop_w, crop_h, width, height)
+    vf     = build_vf(_crop_x, _crop_y, _crop_w, _crop_h, _width, _height)
     code, err = process_video_to_format(
-        input_video, output, format, crf, preset, trim_start, trim_end, vf
+        input_video, output, format, crf, preset, _trim_start, _trim_end, vf
     )
 
     if code != 0:
