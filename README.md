@@ -27,17 +27,50 @@ qween-ffmpeg/
 
 ## Quick start — Local
 
-**Requirements:** Node 18+, Python 3.10+, ffmpeg on PATH
+**Requirements:** Node 20+, Python 3.11+, pnpm 9+, ffmpeg (see below)
 
+### 1. Install ffmpeg (system binary — required)
+
+**macOS**
 ```bash
-# 1. Install everything
-npm install
-cd apps/web && npm install
+brew install ffmpeg
+```
+
+**Ubuntu / Debian**
+```bash
+sudo apt update && sudo apt install -y ffmpeg
+```
+
+**Windows**
+```bash
+winget install ffmpeg
+```
+
+Verify:
+```bash
+ffmpeg -version
+ffprobe -version
+```
+
+### 2. Install pnpm (if not already)
+```bash
+npm install -g pnpm@9.1.0
+```
+
+### 3. Install project dependencies
+```bash
+# Web (Next.js)
+cd apps/web && pnpm install
+
+# API (Python)
 cd ../api && pip install -r requirements.txt
 python -m playwright install chromium --with-deps
+```
 
-# 2. Run both servers from repo root
-npm run dev
+### 4. Run both servers
+```bash
+# From repo root — starts both concurrently
+pnpm dev
 ```
 
 - UI → http://localhost:3000  
