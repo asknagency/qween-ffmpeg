@@ -192,7 +192,7 @@ async def upload_frames(file: UploadFile = File(...)):
     zip_path = job_dir / "upload.zip"
 
     async with aiofiles.open(zip_path, "wb") as f:
-        f.write(await file.read())
+        await f.write(await file.read())
 
     with zipfile.ZipFile(zip_path) as z:
         z.extractall(frames_dir)
@@ -245,7 +245,7 @@ async def upload_video(file: UploadFile = File(...)):
     video_path = job_dir / f"input{suffix}"
 
     async with aiofiles.open(raw_path, "wb") as f:
-        f.write(await file.read())
+        await f.write(await file.read())
 
     # Remux to fix moov atom position, incomplete files, or codec issues
     # -movflags faststart moves moov atom to front (fixes "moov atom not found")
