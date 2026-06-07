@@ -1,15 +1,20 @@
 # QweenFFmpeg
 
-Server-side video render pipeline for [QweenApp](https://github.com/your-org/qween-app).  
-Upload a ZIP of frames **or** send a full stage composition — server renders via Playwright + ffmpeg.
+Server-side video render and processing pipeline for [QweenApp](https://github.com/your-org/qween-app).  
+Stitch frames into video, or process existing videos — crop, trim, scale, segment — with output format choice.
 
 ```
 qween-ffmpeg/
 ├── apps/
-│   ├── api/          ← Python FastAPI  (port 8000)
-│   └── web/          ← Next.js 14 UI  (port 3000)
+│   ├── api/               ← Python FastAPI  (port 8000)
+│   └── web/               ← Next.js 14 UI   (port 3000)
+│       └── src/
+│           ├── app/       ← Shell + routing
+│           ├── components/ui/  ← Shared UI primitives
+│           ├── tools/     ← One file per tool
+│           └── lib/api.ts ← API client
 ├── .codesandbox/
-│   └── tasks.json    ← auto-start config
+│   └── tasks.json         ← Setup + manual run tasks
 ├── .github/
 │   └── workflows/ci.yml
 └── README.md
@@ -17,32 +22,46 @@ qween-ffmpeg/
 
 ---
 
-## Quick start — CodeSandbox
+## Tools
 
-1. Upload this repo (or connect GitHub)
-2. CodeSandbox reads `.codesandbox/tasks.json` and auto-installs + starts both servers
-3. Open port **3000** for the UI · port **8000/docs** for the Swagger API explorer
+| Tool | Input | What it does |
+|------|-------|-------------|
+| **Stitch** | ZIP of image frames | Assembles frames → video at chosen FPS, quality, and format |
+| **Crop** | Video file | Crops a region from the video |
+| **Trim** | Video file | Cuts start/end by time |
+| **Scale** | Video file | Resizes to preset or custom dimensions |
+| **Segment** | Video file | Splits into equal-length chunks |
+
+**Output formats:** MP4, MOV, WebM, GIF *(GIF on Stitch only)*
 
 ---
 
-## Quick start — Local
+## Setup — CodeSandbox
 
-**Requirements:** Node 20+, Python 3.11+, pnpm 9+, ffmpeg (see below)
+Dependencies are installed automatically on sandbox boot via `setupTasks` in `.codesandbox/tasks.json`.  
+Servers are **not** auto-started — run them manually from the Tasks panel:
 
-### 1. Install ffmpeg (system binary — required)
+1. Click **▶ Run API (FastAPI :8000)** — starts the Python API
+2. Click **▶ Run Web (Next.js :3000)** — starts the Next.js UI
+3. Open port **3000** for the UI · port **8000/docs** for the Swagger explorer
+4. Optionally run **✓ Health check** to verify ffmpeg is available
 
-**macOS**
+---
+
+## Setup — Local
+
+### 1. Install system dependencies
+
+**ffmpeg** (required — system binary, not a pip package):
+
 ```bash
+# macOS
 brew install ffmpeg
-```
 
-**Ubuntu / Debian**
-```bash
+# Ubuntu / Debian
 sudo apt update && sudo apt install -y ffmpeg
-```
 
-**Windows**
-```bash
+# Windows
 winget install ffmpeg
 ```
 
@@ -52,43 +71,55 @@ ffmpeg -version
 ffprobe -version
 ```
 
-### 2. Install pnpm (if not already)
+**pnpm** (required for Next.js):
 ```bash
 npm install -g pnpm@9.1.0
 ```
 
-### 3. Install project dependencies
+### 2. Install project dependencies
+
 ```bash
-# Web (Next.js)
+# Next.js
 cd apps/web && pnpm install
 
-# API (Python)
-cd ../api && pip install -r requirements.txt
+# Python API
+cd apps/api
+pip install -r requirements.txt
 python -m playwright install chromium --with-deps
 ```
 
-### 4. Run both servers
+### 3. Run servers
+
+Run each in a separate terminal:
+
 ```bash
-# From repo root — starts both concurrently
-pnpm dev
+# Terminal 1 — API
+cd apps/api && uvicorn main:app --reload --port 8000 --host 0.0.0.0
+
+# Terminal 2 — Web
+cd apps/web && pnpm dev
 ```
 
-- UI → http://localhost:3000  
+- UI → http://localhost:3000
 - API docs → http://localhost:8000/docs
+
+Or run both at once from the project root:
+```bash
+pnpm dev
+```
 
 ---
 
 ## Connecting QweenApp
 
 In QweenApp v183+, open the menu → **Render to Server…**  
-Paste your server URL (e.g. `https://xxxx-8000.csb.app`) into the **Render Server URL** field.  
-It is saved to `localStorage` — set it once and forget it.
+Paste your API server URL (e.g. `https://xxxx-8000.csb.app`) into the **Render Server URL** field.
 
-Two render modes are available from within QweenApp:
+Two render modes:
 
 | Button | Mode | Best for |
 |--------|------|----------|
-| **▶ SVG Render** | Captures frames in-browser via GSAP seek → sends ZIP → server stitches | SVG/animation-only compositions |
+| **▶ SVG Render** | Captures frames in-browser via GSAP seek → sends ZIP → server stitches | SVG / animation-only compositions |
 | **◈ Video Render** | Sends full stage HTML + video blobs + fonts → Playwright renders frame-by-frame | Mixed video + SVG compositions |
 
 ---
@@ -97,20 +128,20 @@ Two render modes are available from within QweenApp:
 
 ```
 QweenApp browser
-  └─ collects: stage HTML, video blobs (from IndexedDB), fonts, node metadata
+  └─ collects: stage HTML, video blobs (IndexedDB), fonts, node metadata
        └─ POST /jobs/playwright-render
-            └─ FastAPI spins up a thread
+            └─ FastAPI spawns a thread
                  └─ Playwright (headless Chromium)
                       ├─ loads self-contained stage HTML
-                      ├─ injects video base64 src + font @font-face
+                      ├─ injects video base64 src + @font-face
                       ├─ waits for all <video> canplay events
                       └─ per frame:
-                           ├─ window.__qween_seek(t)   ← seeks GSAP + all videos
+                           ├─ window.__qween_seek(t)
                            ├─ waits for seeked + rAF flush
                            └─ page.screenshot() → frame_NNNNNN.png
-                 └─ ffmpeg stitches frames → output.mp4
-            └─ GET /jobs/{id}/status  ← QweenApp polls until done
-       └─ GET /jobs/{id}/download     ← download MP4
+                 └─ ffmpeg stitches → output file
+            └─ GET /jobs/{id}/status  ← poll until done
+       └─ GET /jobs/{id}/download     ← download result
 ```
 
 ---
@@ -119,19 +150,20 @@ QweenApp browser
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/health` | ffmpeg version check |
-| `POST` | `/jobs/upload` | Upload ZIP of frames → extract |
-| `GET` | `/jobs/{id}/frame/{n}` | Serve preview frame |
-| `POST` | `/jobs/{id}/stitch` | Stitch frames → MP4 |
-| `GET` | `/jobs/{id}/download` | Download output MP4 |
-| `POST` | `/jobs/{id}/segment` | Split MP4 into chunks |
-| `GET` | `/jobs/{id}/segment/{n}` | Download segment |
-| `DELETE` | `/jobs/{id}` | Clean up job files |
-| `GET` | `/jobs` | List active jobs |
-| `POST` | `/jobs/playwright-render` | Full Playwright render (JSON payload) |
-| `GET` | `/jobs/{id}/status` | Poll render job progress |
+| `GET`    | `/health`                      | ffmpeg version check |
+| `POST`   | `/jobs/upload`                 | Upload ZIP of frames → extract |
+| `GET`    | `/jobs/{id}/frame/{n}`         | Serve preview frame |
+| `POST`   | `/jobs/{id}/stitch`            | Stitch frames → video (format param) |
+| `POST`   | `/jobs/{id}/process`           | Process video file (crop/trim/scale/format) |
+| `GET`    | `/jobs/{id}/download`          | Download output file |
+| `POST`   | `/jobs/{id}/segment`           | Split video into chunks |
+| `GET`    | `/jobs/{id}/segment/{n}`       | Download a segment |
+| `DELETE` | `/jobs/{id}`                   | Clean up job files |
+| `GET`    | `/jobs`                        | List active jobs |
+| `POST`   | `/jobs/playwright-render`      | Full Playwright render (JSON payload) |
+| `GET`    | `/jobs/{id}/status`            | Poll render job progress |
 
-Full interactive docs at `/docs` (Swagger UI).
+Full interactive docs at `/docs`.
 
 ---
 
@@ -142,10 +174,25 @@ Full interactive docs at `/docs` (Swagger UI).
 | `fps` | `30` | Frames per second |
 | `crf` | `18` | Quality — 0 (lossless) to 51 (worst) |
 | `preset` | `medium` | Encode speed (`ultrafast` → `veryslow`) |
-| `width` / `height` | source | Scale output (use `-2` for auto-fit) |
+| `format` | `mp4` | Output format: `mp4`, `mov`, `webm`, `gif` |
+| `width` / `height` | source | Scale output (`-2` = auto-fit) |
 | `trim_start` / `trim_end` | — | Trim in seconds |
 | `crop_x/y/w/h` | — | Crop region |
-| `segment_duration` | `5` | Seconds per segment when splitting |
+
+## Process parameters (Crop / Trim / Scale)
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `format` | `mp4` | Output format: `mp4`, `mov`, `webm` |
+| `width` / `height` | source | Scale output |
+| `trim_start` / `trim_end` | — | Trim in seconds |
+| `crop_x/y/w/h` | — | Crop region |
+
+## Segment parameters
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `segment_duration` | `5` | Seconds per segment |
 
 ---
 
@@ -156,4 +203,15 @@ Full interactive docs at `/docs` (Swagger UI).
 | 0–17 | Lossless / near-lossless |
 | 18 *(default)* | Visually lossless |
 | 19–28 | Good — smaller file |
-| 29+ | Lossy — use only for drafts |
+| 29+ | Lossy — drafts only |
+
+---
+
+## Output format notes
+
+| Format | Codec | Notes |
+|--------|-------|-------|
+| MP4 | H.264 (libx264) | Best compatibility |
+| MOV | H.264 (libx264) | Apple ecosystem |
+| WebM | VP9 (libvpx-vp9) | Web / open format — slower encode |
+| GIF | palette-based | Stitch only · large files, 256 colours |
