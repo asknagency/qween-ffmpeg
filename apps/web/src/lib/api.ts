@@ -39,12 +39,28 @@ export interface ProcessParams {
   crop_x?: number; crop_y?: number; crop_w?: number; crop_h?: number
 }
 
+// ── Error helper ─────────────────────────────────────────────────────────────
+async function extractError(r: Response, fallback: string): Promise<string> {
+  try {
+    const body = await r.json()
+    if (typeof body.detail === 'string') return body.detail
+    if (Array.isArray(body.detail)) {
+      // FastAPI 422 validation errors — each item has loc + msg
+      return body.detail.map((e: any) => `${e.loc?.slice(-1)[0] ?? 'field'}: ${e.msg}`).join(' · ')
+    }
+    if (body.message) return body.message
+    return fallback
+  } catch {
+    return fallback
+  }
+}
+
 // ── Upload ZIP of frames (Stitch only) ───────────────────────────────────────
 export async function uploadZip(file: File, base = DEFAULT_BASE): Promise<UploadResult> {
   const fd = new FormData()
   fd.append('file', file)
   const r = await fetch(`${base}/jobs/upload`, { method: 'POST', body: fd })
-  if (!r.ok) throw new Error((await r.json()).detail ?? 'Upload failed')
+  if (!r.ok) throw new Error(await extractError(r, 'Upload failed'))
   return r.json()
 }
 
@@ -53,7 +69,7 @@ export async function uploadVideo(file: File, base = DEFAULT_BASE): Promise<Vide
   const fd = new FormData()
   fd.append('file', file)
   const r = await fetch(`${base}/jobs/upload-video`, { method: 'POST', body: fd })
-  if (!r.ok) throw new Error((await r.json()).detail ?? 'Upload failed')
+  if (!r.ok) throw new Error(await extractError(r, 'Upload failed'))
   return r.json()
 }
 
@@ -64,7 +80,7 @@ export async function stitch(jobId: string, params: StitchParams, base = DEFAULT
     if (v !== undefined && v !== null && v !== '') fd.append(k, String(v))
   })
   const r = await fetch(`${base}/jobs/${jobId}/stitch`, { method: 'POST', body: fd })
-  if (!r.ok) throw new Error((await r.json()).detail ?? 'Stitch failed')
+  if (!r.ok) throw new Error(await extractError(r, 'Stitch failed'))
   return r.json()
 }
 
@@ -75,7 +91,7 @@ export async function processVideo(jobId: string, params: ProcessParams, base = 
     if (v !== undefined && v !== null && v !== '') fd.append(k, String(v))
   })
   const r = await fetch(`${base}/jobs/${jobId}/process`, { method: 'POST', body: fd })
-  if (!r.ok) throw new Error((await r.json()).detail ?? 'Process failed')
+  if (!r.ok) throw new Error(await extractError(r, 'Process failed'))
   return r.json()
 }
 
@@ -84,7 +100,7 @@ export async function segment(jobId: string, duration: number, base = DEFAULT_BA
   const fd = new FormData()
   fd.append('segment_duration', String(duration))
   const r = await fetch(`${base}/jobs/${jobId}/segment`, { method: 'POST', body: fd })
-  if (!r.ok) throw new Error((await r.json()).detail ?? 'Segment failed')
+  if (!r.ok) throw new Error(await extractError(r, 'Segment failed'))
   return r.json()
 }
 
