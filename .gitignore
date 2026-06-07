@@ -33,3 +33,8 @@ Thumbs.db
 .env
 .env.local
 .env.production
+
+# pnpm
+.pnpm-store/
+apps/web/node_modules/
+node_modules/

@@ -2,10 +2,12 @@
   "name": "qween-ffmpeg-web",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "pnpm@9.1.0",
   "scripts": {
     "dev": "next dev --port 3000",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "next": "14.2.3",
