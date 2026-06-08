@@ -1,6 +1,6 @@
 'use client'
 import { useState } from 'react'
-import { DropZone, Btn, Card, Field, NumInput, PillGroup, Select, SectionTitle, LogBox, ErrorBox, DownloadBtn, FramePreview } from '@/components/ui'
+import { DropZone, Btn, Card, Field, NumInput, PillGroup, Select, SectionTitle, LogBox, ErrorBox, DownloadBtn, FramePreview, UploadProgress } from '@/components/ui'
 import { uploadZip, stitch, downloadUrl, ALL_FORMATS, FORMAT_LABELS } from '@/lib/api'
 import type { OutputFormat } from '@/lib/api'
 
@@ -15,6 +15,7 @@ export default function StitchTool({ apiBase }: { apiBase: string }) {
   const [result, setResult] = useState<any>(null)
   const [log, setLog]       = useState<string[]>([])
   const [error, setError]   = useState('')
+  const [uploadPct, setUploadPct] = useState(0)
   const [fps, setFps]       = useState(30)
   const [crf, setCrf]       = useState(18)
   const [preset, setPreset] = useState('medium')
@@ -29,7 +30,7 @@ export default function StitchTool({ apiBase }: { apiBase: string }) {
     setFile(f); setError(''); setLog([]); setResult(null); setStage('uploading')
     addLog(`Uploading ${f.name}…`)
     try {
-      const r = await uploadZip(f, apiBase)
+      const r = await uploadZip(f, apiBase, setUploadPct)
       setUpload(r)
       addLog(`✓ ${r.frame_count} frames · ${r.width}×${r.height}`)
       setStage('ready')
@@ -69,7 +70,8 @@ export default function StitchTool({ apiBase }: { apiBase: string }) {
           <svg className="spin" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#7c6dfa" strokeWidth="2.5">
             <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
           </svg>
-          <span className="text-sub text-sm font-mono">Extracting frames…</span>
+          <UploadProgress pct={uploadPct} label="Uploading ZIP…" />
+          <span className="text-sub text-sm font-mono mt-2">{uploadPct >= 100 ? "Extracting frames…" : "Uploading…"}</span>
         </Card>
       )}
 

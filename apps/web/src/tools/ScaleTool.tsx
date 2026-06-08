@@ -1,6 +1,6 @@
 'use client'
 import { useState } from 'react'
-import { DropZone, Btn, Card, Field, NumInput, SectionTitle, LogBox, ErrorBox, DownloadBtn, PillGroup } from '@/components/ui'
+import { DropZone, Btn, Card, Field, NumInput, SectionTitle, LogBox, ErrorBox, DownloadBtn, PillGroup, UploadProgress } from '@/components/ui'
 import { uploadVideo, processVideo, downloadUrl, VIDEO_FORMATS, FORMAT_LABELS } from '@/lib/api'
 import type { VideoFormat } from '@/lib/api'
 
@@ -21,6 +21,7 @@ export default function ScaleTool({ apiBase }: { apiBase: string }) {
   const [result, setResult] = useState<any>(null)
   const [log, setLog]       = useState<string[]>([])
   const [error, setError]   = useState('')
+  const [uploadPct, setUploadPct] = useState(0)
   const [format, setFormat] = useState<VideoFormat>('mp4')
   const [width, setWidth]   = useState('')
   const [height, setHeight] = useState('')
@@ -31,7 +32,7 @@ export default function ScaleTool({ apiBase }: { apiBase: string }) {
     setFile(f); setError(''); setLog([]); setResult(null); setStage('uploading')
     addLog(`Uploading ${f.name}…`)
     try {
-      const r = await uploadVideo(f, apiBase)
+      const r = await uploadVideo(f, apiBase, setUploadPct)
       setUpload(r)
       addLog(`✓ ${r.width}×${r.height} · ${Number(r.duration).toFixed(1)}s`)
       setStage('ready')
@@ -74,7 +75,8 @@ export default function ScaleTool({ apiBase }: { apiBase: string }) {
           <svg className="spin" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#7c6dfa" strokeWidth="2.5">
             <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
           </svg>
-          <span className="text-sub text-sm font-mono">Uploading video…</span>
+          <UploadProgress pct={uploadPct} label="Uploading video…" />
+          <span className="text-sub text-sm font-mono mt-2">{uploadPct >= 100 ? "Processing…" : "Uploading…"}</span>
         </Card>
       )}
 

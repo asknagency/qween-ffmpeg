@@ -243,3 +243,39 @@ export function FramePreview({ jobId, frameCount, width, height, apiBase }: {
     </Card>
   )
 }
+
+// ── UploadProgress ────────────────────────────────────────────────────────────
+export function UploadProgress({ pct, label = 'Uploading…' }: { pct: number; label?: string }) {
+  if (pct <= 0 || pct >= 100) return null
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center justify-between text-xs font-mono">
+        <span className="text-sub">{label}</span>
+        <span className="text-accent">{pct}%</span>
+      </div>
+      <div className="h-1.5 bg-bg border border-border rounded-full overflow-hidden">
+        <div
+          className="h-full bg-accent rounded-full transition-all duration-200"
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+    </div>
+  )
+}
+
+// ── StorageBadge ──────────────────────────────────────────────────────────────
+export function StorageBadge({ mb, onClean }: { mb: number; onClean: () => void }) {
+  const color = mb > 400 ? 'text-red' : mb > 200 ? 'text-amber-400' : 'text-muted'
+  return (
+    <button onClick={onClean}
+      className={`flex items-center gap-1.5 text-[10px] font-mono ${color}
+        bg-bg border border-border rounded-lg px-2 py-1 active:scale-95 transition-transform`}
+      title="Tap to clean all jobs">
+      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+        <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/>
+        <path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/>
+      </svg>
+      {mb.toFixed(0)} MB
+    </button>
+  )
+}

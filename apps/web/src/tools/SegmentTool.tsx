@@ -1,6 +1,6 @@
 'use client'
 import { useState } from 'react'
-import { DropZone, Btn, Card, Field, NumInput, SectionTitle, LogBox, ErrorBox, PillGroup } from '@/components/ui'
+import { DropZone, Btn, Card, Field, NumInput, SectionTitle, LogBox, ErrorBox, PillGroup, UploadProgress } from '@/components/ui'
 import { uploadVideo, segment, segmentDownloadUrl } from '@/lib/api'
 
 const DURATION_OPTIONS = [2, 5, 10, 15, 30, 60]
@@ -24,7 +24,7 @@ export default function SegmentTool({ apiBase }: { apiBase: string }) {
     setFile(f); setError(''); setLog([]); setSegResult(null); setStage('uploading')
     addLog(`Uploading ${f.name}…`)
     try {
-      const r = await uploadVideo(f, apiBase)
+      const r = await uploadVideo(f, apiBase, setUploadPct)
       setUpload(r)
       addLog(`✓ ${r.width}×${r.height} · ${Number(r.duration).toFixed(1)}s`)
       setStage('ready')
@@ -60,7 +60,8 @@ export default function SegmentTool({ apiBase }: { apiBase: string }) {
           <svg className="spin" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#7c6dfa" strokeWidth="2.5">
             <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
           </svg>
-          <span className="text-sub text-sm font-mono">Uploading video…</span>
+          <UploadProgress pct={uploadPct} label="Uploading video…" />
+          <span className="text-sub text-sm font-mono mt-2">{uploadPct >= 100 ? "Processing…" : "Uploading…"}</span>
         </Card>
       )}
 
