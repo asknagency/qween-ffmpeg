@@ -4,24 +4,24 @@ import { DropZone, Btn, Card, Field, NumInput, SectionTitle, LogBox, ErrorBox, P
 import { uploadVideo, segment, segmentDownloadUrl } from '@/lib/api'
 
 const DURATION_OPTIONS = [2, 5, 10, 15, 30, 60]
-type Stage = 'idle' | 'uploading' | 'ready' | 'segmenting' | 'done'
+type Stage = 'idle' | 'uploading' | 'ready' | 'segmenting' | 'done' | 'error'
 
 export default function SegmentTool({ apiBase }: { apiBase: string }) {
-  const [file, setFile]       = useState<File | null>(null)
-  const [stage, setStage]     = useState<Stage>('idle')
-  const [upload, setUpload]   = useState<any>(null)
+  const [file, setFile]         = useState<File | null>(null)
+  const [stage, setStage]       = useState<Stage>('idle')
+  const [upload, setUpload]     = useState<any>(null)
   const [segResult, setSegResult] = useState<any>(null)
-  const [log, setLog]         = useState<string[]>([])
-  const [error, setError]     = useState('')
+  const [log, setLog]           = useState<string[]>([])
+  const [error, setError]       = useState('')
+  const [uploadPct, setUploadPct] = useState(0)
   const [duration, setDuration] = useState(5)
   const [customDur, setCustomDur] = useState('')
 
   const addLog    = (m: string) => setLog(p => [...p, m])
   const activeDur = customDur ? Number(customDur) : duration
-  const totalSec  = upload ? Number(upload.duration).toFixed(1) : '—'
 
   const handleFile = async (f: File) => {
-    setFile(f); setError(''); setLog([]); setSegResult(null); setStage('uploading')
+    setFile(f); setError(''); setLog([]); setSegResult(null); setUploadPct(0); setStage('uploading')
     addLog(`Uploading ${f.name}…`)
     try {
       const r = await uploadVideo(f, apiBase, setUploadPct)
@@ -40,7 +40,7 @@ export default function SegmentTool({ apiBase }: { apiBase: string }) {
       setSegResult(r)
       addLog(`✓ ${r.segment_count} segments created`)
       setStage('done')
-    } catch (e: any) { setError(e.message); setStage('ready') }
+    } catch (e: any) { setError(e.message); setStage('error') }
   }
 
   const reset = () => {
@@ -50,18 +50,15 @@ export default function SegmentTool({ apiBase }: { apiBase: string }) {
 
   return (
     <div className="flex flex-col gap-4 pb-6">
-      <DropZone onFile={handleFile} loading={stage === 'uploading'} file={file}
+      <DropZone onFile={handleFile} loading={stage==='uploading'} file={file}
         accept=".mp4,.mov,.webm,.avi,.mkv"
         label="Drop a video file to segment"
         sub="MP4 · MOV · WebM · AVI · MKV" />
 
       {stage === 'uploading' && (
-        <Card className="p-6 flex items-center justify-center gap-3">
-          <svg className="spin" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#7c6dfa" strokeWidth="2.5">
-            <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
-          </svg>
+        <Card className="p-4 flex flex-col gap-3">
           <UploadProgress pct={uploadPct} label="Uploading video…" />
-          <span className="text-sub text-sm font-mono mt-2">{uploadPct >= 100 ? "Processing…" : "Uploading…"}</span>
+          <span className="text-sub text-xs font-mono text-center">{uploadPct >= 100 ? 'Processing…' : 'Uploading…'}</span>
         </Card>
       )}
 
@@ -69,22 +66,21 @@ export default function SegmentTool({ apiBase }: { apiBase: string }) {
         <Card className="px-4 py-3 flex items-center gap-3">
           <div className="w-8 h-8 rounded-lg bg-accent/10 border border-accent/20 flex items-center justify-center flex-shrink-0">
             <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="#7c6dfa" strokeWidth="2">
-              <rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>
+              <rect x="2" y="3" width="20" height="14" rx="2"/>
+              <line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>
             </svg>
           </div>
           <div className="text-xs font-mono">
             <span className="text-text">{upload.width}×{upload.height}</span>
-            <span className="text-muted ml-2">{totalSec}s</span>
+            <span className="text-muted ml-2">{Number(upload.duration).toFixed(1)}s</span>
             {upload && activeDur > 0 && (
-              <span className="text-muted ml-2">
-                → ~{Math.ceil(Number(upload.duration) / activeDur)} segments
-              </span>
+              <span className="text-muted ml-2">→ ~{Math.ceil(Number(upload.duration)/activeDur)} segs</span>
             )}
           </div>
         </Card>
       )}
 
-      {(stage === 'ready' || stage === 'segmenting' || stage === 'done') && !segResult && (
+      {(stage === 'ready' || stage === 'segmenting' || stage === 'error') && !segResult && (
         <Card className="p-4 flex flex-col gap-5">
           <div>
             <SectionTitle>Segment Duration</SectionTitle>
@@ -92,16 +88,24 @@ export default function SegmentTool({ apiBase }: { apiBase: string }) {
               onChange={v => { setDuration(Number(v)); setCustomDur('') }} />
             <div className="mt-3">
               <Field label="Custom (seconds)">
-                <NumInput value={customDur} onChange={setCustomDur}
-                  placeholder="e.g. 7.5" min={0.5} step={0.5} />
+                <NumInput value={customDur} onChange={setCustomDur} placeholder="e.g. 7.5" min={0.5} step={0.5} />
               </Field>
             </div>
             {upload && (
               <p className="text-[11px] text-muted font-mono mt-3">
-                {totalSec}s video → ~{Math.ceil(Number(upload.duration) / activeDur)} × {activeDur}s chunks
+                {Number(upload.duration).toFixed(1)}s video → ~{Math.ceil(Number(upload.duration)/activeDur)} × {activeDur}s chunks
               </p>
             )}
           </div>
+        </Card>
+      )}
+
+      {stage === 'segmenting' && (
+        <Card className="p-4 flex items-center gap-3">
+          <svg className="spin" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#7c6dfa" strokeWidth="2.5">
+            <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+          </svg>
+          <span className="text-sub text-sm font-mono">Splitting into {activeDur}s chunks…</span>
         </Card>
       )}
 
@@ -112,15 +116,12 @@ export default function SegmentTool({ apiBase }: { apiBase: string }) {
         <Card className="p-4 flex flex-col gap-3">
           <div className="flex items-center gap-2">
             <div className="w-2 h-2 rounded-full bg-green animate-pulse" />
-            <span className="text-sm font-semibold text-text">
-              {segResult.segment_count} segments ready
-            </span>
+            <span className="text-sm font-semibold text-text">{segResult.segment_count} segments ready</span>
           </div>
           <div className="flex flex-col gap-1.5 max-h-64 overflow-y-auto">
             {segResult.segments.map((seg: any) => (
               <a key={seg.index}
-                href={segmentDownloadUrl(upload.job_id, seg.index, apiBase)}
-                download
+                href={segmentDownloadUrl(upload.job_id, seg.index, apiBase)} download
                 className="flex items-center justify-between px-3 py-3 rounded-xl bg-bg border border-border
                   hover:border-accent/40 transition-colors active:scale-95">
                 <span className="text-xs font-mono text-sub">{seg.filename}</span>
@@ -135,9 +136,9 @@ export default function SegmentTool({ apiBase }: { apiBase: string }) {
         </Card>
       )}
 
-      {(stage === 'ready' || stage === 'segmenting') && !segResult && (
-        <Btn onClick={handleSegment} loading={stage === 'segmenting'} fullWidth>
-          {stage === 'segmenting' ? 'Segmenting…' : `Split into ${activeDur}s Chunks`}
+      {(stage === 'ready' || stage === 'error') && !segResult && (
+        <Btn onClick={handleSegment} fullWidth>
+          Split into {activeDur}s Chunks
         </Btn>
       )}
     </div>

@@ -5,6 +5,8 @@ import CropTool    from '@/tools/CropTool'
 import TrimTool    from '@/tools/TrimTool'
 import ScaleTool   from '@/tools/ScaleTool'
 import SegmentTool from '@/tools/SegmentTool'
+import MergeTool   from '@/tools/MergeTool'
+import RecentTool  from '@/tools/RecentTool'
 import { StorageBadge } from '@/components/ui'
 import { getStorage, cleanAllJobs } from '@/lib/api'
 
@@ -16,6 +18,8 @@ const TABS = [
   { id: 'trim',    label: 'Trim',    desc: 'Cut start/end'   },
   { id: 'scale',   label: 'Scale',   desc: 'Resize output'   },
   { id: 'segment', label: 'Segment', desc: 'Split chunks'    },
+  { id: 'merge',   label: 'Merge',   desc: 'Concat videos'   },
+  { id: 'recent',  label: 'Recent',  desc: 'Job history'     },
 ] as const
 type TabId = (typeof TABS)[number]['id']
 
@@ -26,10 +30,7 @@ export default function Home() {
   const current = TABS.find(t => t.id === active)!
 
   const fetchStorage = useCallback(async () => {
-    try {
-      const s = await getStorage(API_BASE)
-      setStorageMb(s.storage_used_mb)
-    } catch {}
+    try { setStorageMb((await getStorage(API_BASE)).storage_used_mb) } catch {}
   }, [])
 
   useEffect(() => {
@@ -39,15 +40,14 @@ export default function Home() {
   }, [fetchStorage])
 
   const handleClean = async () => {
-    if (!confirm('Delete all completed jobs and free storage?')) return
+    if (!confirm('Delete all jobs and free storage?')) return
     setCleaning(true)
     try {
       const r = await cleanAllJobs(API_BASE)
       alert(`Deleted ${r.deleted_jobs} job(s).`)
       setStorageMb(0)
-    } catch (e: any) {
-      alert(e.message)
-    } finally { setCleaning(false) }
+    } catch (e: any) { alert(e.message) }
+    finally { setCleaning(false) }
   }
 
   return (
@@ -82,13 +82,11 @@ export default function Home() {
             borderRadius: 6, padding: '3px 8px' }}>
             {current.desc}
           </span>
-          {storageMb !== null && (
-            <StorageBadge mb={storageMb} onClean={handleClean} />
-          )}
+          {storageMb !== null && <StorageBadge mb={storageMb} onClean={handleClean} />}
         </div>
       </header>
 
-      {/* Tab bar */}
+      {/* Tab bar — scrollable */}
       <div style={{
         background: '#111116', borderBottom: '1px solid #1e1e28',
         display: 'flex', overflowX: 'auto', flexShrink: 0,
@@ -97,7 +95,7 @@ export default function Home() {
         {TABS.map(tab => (
           <button key={tab.id} onClick={() => setActive(tab.id)}
             style={{
-              flex: '0 0 auto', padding: '10px 20px', cursor: 'pointer',
+              flex: '0 0 auto', padding: '10px 18px', cursor: 'pointer',
               background: 'none', border: 'none',
               borderBottom: active === tab.id ? '2px solid #7c6dfa' : '2px solid transparent',
               color: active === tab.id ? '#7c6dfa' : '#55556a',
@@ -106,8 +104,16 @@ export default function Home() {
               transition: 'color 0.15s',
               WebkitTapHighlightColor: 'transparent',
               userSelect: 'none',
+              position: 'relative',
             }}>
             {tab.label}
+            {/* Dot for Recent tab when it's not active — subtle indicator */}
+            {tab.id === 'recent' && active !== 'recent' && (
+              <span style={{
+                position: 'absolute', top: 8, right: 8,
+                width: 4, height: 4, borderRadius: '50%', background: '#7c6dfa',
+              }} />
+            )}
           </button>
         ))}
       </div>
@@ -120,6 +126,8 @@ export default function Home() {
         {active === 'trim'    && <TrimTool    apiBase={API_BASE} />}
         {active === 'scale'   && <ScaleTool   apiBase={API_BASE} />}
         {active === 'segment' && <SegmentTool apiBase={API_BASE} />}
+        {active === 'merge'   && <MergeTool   apiBase={API_BASE} />}
+        {active === 'recent'  && <RecentTool  apiBase={API_BASE} />}
       </div>
     </div>
   )

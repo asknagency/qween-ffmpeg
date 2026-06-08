@@ -177,3 +177,13 @@ export const frameUrl           = (jobId: string, idx: number, base = DEFAULT_BA
 export const FORMAT_LABELS: Record<string, string> = { mp4: 'MP4', mov: 'MOV', webm: 'WebM', gif: 'GIF' }
 export const VIDEO_FORMATS: VideoFormat[]  = ['mp4', 'mov', 'webm']
 export const ALL_FORMATS:   OutputFormat[] = ['mp4', 'mov', 'webm', 'gif']
+
+// ── Jobs list (for Recent tab) ────────────────────────────────────────────────
+export interface JobRecord {
+  job_id: string; label: string; input_file: string
+  created_at: number; frame_count: number
+  has_output: boolean; format: string | null; size_mb: number | null
+}
+export async function listJobs(base = DEFAULT_BASE): Promise<{ jobs: JobRecord[] }> {
+  return apiFetch(`${base}/jobs`, { method: 'GET' }, 'Could not fetch jobs')
+}
