@@ -29,7 +29,7 @@ AUTO_CLEAN_HOURS = 6
 FORMAT_CONFIG = {
     "mp4":  {"ext": ".mp4",  "mime": "video/mp4",      "codec_args": ["-c:v", "libx264", "-pix_fmt", "yuv420p"]},
     "mov":  {"ext": ".mov",  "mime": "video/quicktime", "codec_args": ["-c:v", "libx264", "-pix_fmt", "yuv420p"]},
-    "webm": {"ext": ".webm", "mime": "video/webm",      "codec_args": ["-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p"]},
+    "webm": {"ext": ".webm", "mime": "video/webm",      "codec_args": ["-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p"]},
     "gif":  {"ext": ".gif",  "mime": "image/gif",       "codec_args": []},
 }
 VALID_FORMATS       = set(FORMAT_CONFIG.keys())
@@ -624,7 +624,8 @@ class PlaywrightRenderRequest(BaseModel):
     gsapCdn: str = "https://cdnjs.cloudflare.com/ajax/libs/gsap/3.13.0/gsap.min.js"
 
 def _build_stage_html(req, job_dir):
-    font_css = ""
+    fmt = getattr(req, 'format', 'mp4')
+    stage_bg = 'transparent' if fmt == 'webm' else '#000'
     for f in req.fontAssets:
         font_css += (f"@font-face{{font-family:'{f.family}';font-weight:{f.weight};"
                      f"font-style:{f.style};src:url('data:font/{f.format};base64,{f.b64}') format('{f.format}');}}\n")
@@ -643,7 +644,7 @@ def _build_stage_html(req, job_dir):
     for va in req.videoAssets:
         video_js += f"_videoAssets['{va.dbId}']='data:{va.mimeType};base64,{va.b64}';\n"
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
-*{{margin:0;padding:0;box-sizing:border-box;}}body{{background:#000;overflow:hidden;}}
+*{{margin:0;padding:0;box-sizing:border-box;}}body{{background:{stage_bg};overflow:hidden;}}
 #stage{{position:relative;width:{req.stageWidth}px;height:{req.stageHeight}px;overflow:hidden;}}
 {font_css}</style></head><body><div id="stage">{nodes_html}</div>
 <script src="{req.gsapCdn}"></script><script>{video_js}
@@ -680,6 +681,10 @@ def _run_playwright_render(job_id: str, req, job_dir: Path):
                 "--disable-web-security","--allow-file-access-from-files",
             ])
             page = browser.new_page(viewport={"width": w, "height": h})
+            # For WebM: set transparent background so alpha is preserved
+            if fmt == 'webm':
+                page.emulate_media(color_scheme='light')
+                page.evaluate("document.documentElement.style.background = 'transparent'")
             page.goto(f"file://{html_path.resolve()}")
             page.wait_for_function("window.__qween_ready === true", timeout=10_000)
             _job_update(job_id, message="Capturing frames…", progress=5)
@@ -687,8 +692,11 @@ def _run_playwright_render(job_id: str, req, job_dir: Path):
                 t = req.startTime + (i / fps)
                 page.evaluate(f"window.__qween_seek({t})")
                 page.wait_for_function("window.__qween_frame_done === true", timeout=5_000)
-                page.screenshot(path=str(frames_dir / f"frame_{i:06d}.png"),
-                                clip={"x": 0, "y": 0, "width": w, "height": h})
+                page.screenshot(
+                    path=str(frames_dir / f"frame_{i:06d}.png"),
+                    clip={"x": 0, "y": 0, "width": w, "height": h},
+                    omit_background=(fmt == 'webm'),
+                )
                 pct = 5 + round((i + 1) / total_frames * 70)
                 _job_update(job_id, message=f"Frame {i+1}/{total_frames}", progress=pct)
             browser.close()
