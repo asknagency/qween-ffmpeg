@@ -29,7 +29,7 @@ AUTO_CLEAN_HOURS = 6
 FORMAT_CONFIG = {
     "mp4":  {"ext": ".mp4",  "mime": "video/mp4",      "codec_args": ["-c:v", "libx264", "-pix_fmt", "yuv420p"]},
     "mov":  {"ext": ".mov",  "mime": "video/quicktime", "codec_args": ["-c:v", "libx264", "-pix_fmt", "yuv420p"]},
-    "webm": {"ext": ".webm", "mime": "video/webm",      "codec_args": ["-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p"]},
+    "webm": {"ext": ".webm", "mime": "video/webm",      "codec_args": ["-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-auto-alt-ref", "0"]},
     "gif":  {"ext": ".gif",  "mime": "image/gif",       "codec_args": []},
 }
 VALID_FORMATS       = set(FORMAT_CONFIG.keys())
