@@ -728,3 +728,163 @@ async def playwright_render(req: PlaywrightRenderRequest, background_tasks: Back
     t = threading.Thread(target=_run_playwright_render, args=(job_id, req, job_dir), daemon=True)
     t.start()
     return {"job_id": job_id, "status": "queued", "poll_url": f"/jobs/{job_id}/status"}
+
+# ── Playwright Screen Record (new approach — loads real frame HTML) ────────────
+
+class PlaywrightRecordRequest(BaseModel):
+    stageHtml:        str
+    fps:              float = 30
+    crf:              int   = 18
+    format:           str   = "mp4"
+    duration:         float = 5.0
+    startTime:        float = 0
+    stageWidth:       float = 1080
+    stageHeight:      float = 1080
+    scaleMultiplier:  float = 1.0
+
+
+def _run_playwright_record(job_id: str, req: PlaywrightRecordRequest, job_dir: Path):
+    try:
+        from playwright.sync_api import sync_playwright
+
+        fmt = req.format if req.format in VALID_FORMATS else "mp4"
+        w   = int(req.stageWidth  * req.scaleMultiplier)
+        h   = int(req.stageHeight * req.scaleMultiplier)
+        dur = req.duration  # seconds to record
+
+        # ── 1. Write stage HTML ──────────────────────────────────────────────
+        html_path = job_dir / "stage.html"
+        html_path.write_text(req.stageHtml, encoding="utf-8")
+        _job_update(job_id, status="processing", message="Launching browser…", progress=3)
+
+        rec_dir = job_dir / "recording"
+        rec_dir.mkdir()
+
+        with sync_playwright() as p:
+            # ── 2. Launch with screen recording ─────────────────────────────
+            browser = p.chromium.launch(args=[
+                "--no-sandbox", "--disable-setuid-sandbox",
+                "--autoplay-policy=no-user-gesture-required",
+                "--disable-web-security", "--allow-file-access-from-files",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+            ])
+
+            context = browser.new_context(
+                viewport={"width": w, "height": h},
+                record_video_dir=str(rec_dir),
+                record_video_size={"width": w, "height": h},
+                # For WebM: keep bg transparent
+                **({"color_scheme": "light"} if fmt == "webm" else {}),
+            )
+
+            page = context.new_page()
+
+            # ── 3. Load stage ────────────────────────────────────────────────
+            _job_update(job_id, message="Loading stage…", progress=6)
+            page.goto(f"file://{html_path.resolve()}")
+
+            # Wait for GSAP + videos + fonts all ready
+            page.wait_for_function("window.__qween_ready === true", timeout=20_000)
+            _job_update(job_id, message="Stage ready — starting playback…", progress=10)
+
+            # ── 4. Seek to startTime and play ────────────────────────────────
+            page.evaluate(f"""
+                if (window.__masterTl) {{
+                    window.__masterTl.seek({req.startTime});
+                    window.__masterTl.play();
+                }}
+            """)
+
+            # ── 5. Record for duration + small buffer ────────────────────────
+            record_ms = int(dur * 1000) + 600  # 600ms buffer for last frame
+            poll_interval = 500
+            elapsed = 0
+            while elapsed < record_ms:
+                time.sleep(poll_interval / 1000)
+                elapsed += poll_interval
+                pct = 10 + round(elapsed / record_ms * 70)
+                remaining = max(0, (record_ms - elapsed) / 1000)
+                _job_update(job_id,
+                    message=f"Recording… {elapsed/1000:.1f}s / {dur:.1f}s ({remaining:.1f}s left)",
+                    progress=min(pct, 79))
+
+            # ── 6. Close page + context → flushes recording to disk ─────────
+            _job_update(job_id, message="Flushing recording…", progress=80)
+            page.close()
+            context.close()
+            browser.close()
+
+        # ── 7. Find the recorded file ────────────────────────────────────────
+        recorded = list(rec_dir.glob("*.webm"))
+        if not recorded:
+            raise RuntimeError("Playwright did not produce a recording. Check that the stage loaded correctly.")
+        recorded_path = recorded[0]
+
+        # ── 8. Re-encode with ffmpeg for format/quality control ──────────────
+        output = output_path_for(job_dir, fmt)
+        _job_update(job_id, message=f"Encoding to {fmt.upper()}…", progress=82)
+
+        if fmt == "gif":
+            # Convert webm → PNG frames → palette GIF
+            frames_dir = job_dir / "gif_frames"
+            frames_dir.mkdir()
+            code, _, err = run_ffmpeg_queued([
+                "-i", str(recorded_path),
+                str(frames_dir / "frame_%06d.png")
+            ])
+            if code != 0: raise RuntimeError(friendly_ffmpeg_error(err))
+            code, err = stitch_to_gif(
+                str(frames_dir / "frame_%06d.png"), req.fps, job_dir, output
+            )
+        elif fmt == "webm":
+            # Re-encode as VP9 with alpha
+            code, _, err = run_ffmpeg_queued([
+                "-i", str(recorded_path),
+                "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p",
+                "-auto-alt-ref", "0",
+                "-crf", str(req.crf), "-b:v", "0",
+                str(output)
+            ])
+        elif fmt in ("mp4", "mov"):
+            cfg = FORMAT_CONFIG[fmt]
+            code, _, err = run_ffmpeg_queued([
+                "-i", str(recorded_path),
+                *cfg["codec_args"],
+                "-crf", str(req.crf), "-preset", "medium",
+                str(output)
+            ])
+        else:
+            code, _, err = run_ffmpeg_queued([
+                "-i", str(recorded_path),
+                str(output)
+            ])
+
+        if code != 0:
+            raise RuntimeError(friendly_ffmpeg_error(err))
+
+        mb = round(output.stat().st_size / 1_048_576, 2)
+        _mark_output(job_id, fmt, mb)
+        _job_update(job_id, status="done",
+                    message=f"Done — {mb} MB · {fmt.upper()}",
+                    progress=100, size_mb=mb, format=fmt)
+
+    except Exception as e:
+        _job_update(job_id, status="error", message=str(e), progress=0)
+
+
+@app.post("/jobs/playwright-record")
+async def playwright_record(req: PlaywrightRecordRequest):
+    if req.format not in VALID_FORMATS:
+        raise HTTPException(400, f"Invalid format. Choose from: {', '.join(sorted(VALID_FORMATS))}")
+    job_id, job_dir = new_job(label=f"screen-record → {req.format.upper()}")
+    _job_init(job_id, label=f"Screen Record → {req.format.upper()}")
+    t = threading.Thread(
+        target=_run_playwright_record,
+        args=(job_id, req, job_dir),
+        daemon=True
+    )
+    t.start()
+    return {"job_id": job_id, "status": "queued", "poll_url": f"/jobs/{job_id}/status"}
