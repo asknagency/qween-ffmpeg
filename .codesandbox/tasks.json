@@ -19,6 +19,10 @@
     }
   ],
   "tasks": {
+    "setup:env": {
+      "name": "⚙ Create .env files from .env.example",
+      "command": "[ -f apps/api/.env ] || cp apps/api/.env.example apps/api/.env; [ -f apps/web/.env.local ] || cp apps/web/.env.example apps/web/.env.local; echo 'Env files ready'"
+    },
     "dev:api": {
       "name": "\u25b6 Run API (FastAPI :8000)",
       "command": "cd apps/api && uvicorn main:app --reload --port 8000 --host 0.0.0.0",
