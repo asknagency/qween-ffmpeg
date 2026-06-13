@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 # ── App setup ─────────────────────────────────────────────────────────────────
-app = FastAPI(title="QweenFFmpeg API", version="2.2.0")
+app = FastAPI(title="QweenFFmpeg API", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 WORK_DIR         = Path(tempfile.gettempdir()) / "qween_ffmpeg"
@@ -606,162 +606,140 @@ def job_status(job_id: str):
             "message": "Output ready." if has_output else "Processing…",
             "progress": 100 if has_output else 0}
 
-# ── Playwright render ─────────────────────────────────────────────────────────
-class VideoAsset(BaseModel):
-    nodeId: str; slotId: str; dbId: str; mimeType: str; label: str; b64: str
-class FontAsset(BaseModel):
-    family: str; weight: int = 400; style: str = "normal"; format: str = "woff2"; b64: str
-class NodeMeta(BaseModel):
-    id: str; type: str = "svg"; width: float = 1080; height: float = 1080
-    zIndex: int = 0; visible: bool = True; svgContent: str = ""
-    videoSlots: List[Dict[str, Any]] = []
+
+# ── Playwright Frame-by-Frame Render ──────────────────────────────────────────
+# Single consolidated render endpoint — server-side frame capture with
+# full _videoPlayConfig support. Replaces both playwright-render and
+# playwright-record. Accepts a self-contained stageHtml + tweens JSON.
+
 class PlaywrightRenderRequest(BaseModel):
-    fps: float = 30; crf: int = 18; format: str = "mp4"
-    startTime: float = 0; endTime: float = 5
-    stageWidth: float = 1080; stageHeight: float = 1080
-    nodes: List[NodeMeta] = []; videoAssets: List[VideoAsset] = []
-    fontAssets: List[FontAsset] = []
-    gsapCdn: str = "https://cdnjs.cloudflare.com/ajax/libs/gsap/3.13.0/gsap.min.js"
+    stageHtml:        str                  # self-contained HTML of the live frame
+    tweensJson:       str         = "[]"   # serialized tweens array for __qween_seek
+    fps:              float       = 30
+    crf:              int         = 18
+    format:           str         = "mp4"
+    startTime:        float       = 0
+    endTime:          float       = 5.0
+    stageWidth:       float       = 1080
+    stageHeight:      float       = 1080
+    scaleMultiplier:  float       = 1.0
 
-def _build_stage_html(req, job_dir):
-    fmt = getattr(req, 'format', 'mp4')
-    stage_bg = 'transparent' if fmt == 'webm' else '#000'
-    for f in req.fontAssets:
-        font_css += (f"@font-face{{font-family:'{f.family}';font-weight:{f.weight};"
-                     f"font-style:{f.style};src:url('data:font/{f.format};base64,{f.b64}') format('{f.format}');}}\n")
-    nodes_html = ""
-    for node in sorted(req.nodes, key=lambda n: n.zIndex):
-        if not node.visible: continue
-        style = f"position:absolute;top:0;left:0;width:{node.width}px;height:{node.height}px;z-index:{node.zIndex};"
-        if node.type == "svg":
-            nodes_html += f'<div id="{node.id}" style="{style}">{node.svgContent}</div>\n'
-        elif node.type == "video":
-            for slot in node.videoSlots:
-                slot_id = slot.get("treeId", node.id + "_video"); db_id = slot.get("dbId", "")
-                nodes_html += (f'<video id="{slot_id}" data-dbid="{db_id}" '
-                               f'style="{style}object-fit:contain;" muted playsinline preload="auto"></video>\n')
-    video_js = "const _videoAssets={};\n"
-    for va in req.videoAssets:
-        video_js += f"_videoAssets['{va.dbId}']='data:{va.mimeType};base64,{va.b64}';\n"
-    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
-*{{margin:0;padding:0;box-sizing:border-box;}}body{{background:{stage_bg};overflow:hidden;}}
-#stage{{position:relative;width:{req.stageWidth}px;height:{req.stageHeight}px;overflow:hidden;}}
-{font_css}</style></head><body><div id="stage">{nodes_html}</div>
-<script src="{req.gsapCdn}"></script><script>{video_js}
-document.querySelectorAll('video[data-dbid]').forEach(v=>{{const d=v.getAttribute('data-dbid');if(_videoAssets[d])v.src=_videoAssets[d];}});
-window.__qween_ready=false;window.__qween_frame_done=false;
-Promise.all(Array.from(document.querySelectorAll('video')).map(v=>new Promise(res=>{{
-  if(v.readyState>=2){{res();return;}}v.addEventListener('canplay',res,{{once:true}});v.addEventListener('error',res,{{once:true}});
-}}))).then(()=>{{window.__qween_ready=true;}});
-window.__qween_seek=async function(t){{
-  window.__qween_frame_done=false;
-  if(window.__masterTl){{window.__masterTl.pause();window.__masterTl.time(t);}}
-  const videos=Array.from(document.querySelectorAll('video'));
-  await Promise.all(videos.map(v=>new Promise(res=>{{
-    if(!v.src){{res();return;}}v.pause();v.currentTime=t;
-    const s=()=>{{v.removeEventListener('seeked',s);res();}};v.addEventListener('seeked',s);setTimeout(res,200);
-  }})));
-  await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
-  window.__qween_frame_done=true;
-}};</script></body></html>"""
 
-def _run_playwright_render(job_id: str, req, job_dir: Path):
+def _build_seek_js(tweens_json: str) -> str:
+    """
+    Build the __qween_seek JS function injected into the stage HTML.
+    Handles:
+      - GSAP timeline seek
+      - video element currentTime via seeked event
+      - _videoPlayConfig: maps timeline position t → videoEl.currentTime
+    """
+    return f"""
+window.__qween_tweens = {tweens_json};
+window.__qween_ready = false;
+window.__qween_frame_done = false;
+
+// Resolve videoPlayConfig currentTime for a given timeline position t
+window.__resolve_vpc_time = function(t) {{
+  const tweens = window.__qween_tweens || [];
+  const vpc_map = {{}};  // slotId → currentTime
+  for (const tw of tweens) {{
+    if (!tw._videoPlayConfig) continue;
+    const vpc   = tw._videoPlayConfig;
+    const pos   = parseFloat(tw.position) || 0;
+    const dur   = parseFloat(tw.timingVars && tw.timingVars.duration || tw.duration || 1);
+    const tween_end = pos + dur;
+    if (t < pos || t > tween_end) continue;
+    const progress  = dur > 0 ? (t - pos) / dur : 0;
+    const vt = vpc.fromTime + progress * (vpc.toTime - vpc.fromTime);
+    vpc_map[vpc.slotId] = Math.max(vpc.fromTime, Math.min(vpc.toTime, vt));
+  }}
+  return vpc_map;
+}};
+
+window.__qween_seek = async function(t) {{
+  window.__qween_frame_done = false;
+
+  // 1. Seek GSAP timeline
+  if (window.__masterTl) {{
+    window.__masterTl.pause();
+    window.__masterTl.time(t);
+  }}
+
+  // 2. Resolve _videoPlayConfig times for this t
+  const vpc_map = window.__resolve_vpc_time(t);
+
+  // 3. Seek all video elements — both timeline-driven and vpc-driven
+  const videos = Array.from(document.querySelectorAll('video'));
+  const seekPromises = videos.map(v => new Promise(res => {{
+    if (!v.src) {{ res(); return; }}
+    v.pause();
+    // Determine target currentTime
+    const vpc_t = vpc_map[v.id];
+    const target = (vpc_t !== undefined) ? vpc_t : t;
+    if (Math.abs(v.currentTime - target) < 0.001) {{ res(); return; }}
+    const onSeeked = () => {{ v.removeEventListener('seeked', onSeeked); res(); }};
+    v.addEventListener('seeked', onSeeked);
+    v.currentTime = target;
+    setTimeout(res, 300); // safety timeout
+  }}));
+  await Promise.all(seekPromises);
+
+  // 4. Wait two rAF cycles for paint
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+  window.__qween_frame_done = true;
+}};
+
+// Wait for all video elements ready, then signal __qween_ready
+const _videos = Array.from(document.querySelectorAll('video'));
+Promise.all(_videos.map(v => new Promise(res => {{
+  if (!v.src) {{ res(); return; }}
+  if (v.readyState >= 2) {{ res(); return; }}
+  v.addEventListener('canplay', res, {{ once: true }});
+  v.addEventListener('error',   res, {{ once: true }});
+  setTimeout(res, 5000);
+}}))).then(() => {{ window.__qween_ready = true; }});
+"""
+
+
+def _run_playwright_render(job_id: str, req: PlaywrightRenderRequest, job_dir: Path):
     try:
         from playwright.sync_api import sync_playwright
-        frames_dir = job_dir / "pw_frames"; frames_dir.mkdir()
-        html_path  = job_dir / "stage.html"
-        html_path.write_text(_build_stage_html(req, job_dir), encoding="utf-8")
-        fps = req.fps; total_frames = max(1, round((req.endTime - req.startTime) * fps))
-        w, h = int(req.stageWidth), int(req.stageHeight)
-        _job_update(job_id, status="processing", message="Launching browser…", progress=2)
-        with sync_playwright() as p:
-            browser = p.chromium.launch(args=[
-                "--no-sandbox","--disable-setuid-sandbox",
-                "--autoplay-policy=no-user-gesture-required",
-                "--disable-web-security","--allow-file-access-from-files",
-            ])
-            page = browser.new_page(viewport={"width": w, "height": h})
-            # For WebM: set transparent background so alpha is preserved
-            if fmt == 'webm':
-                page.emulate_media(color_scheme='light')
-                page.evaluate("document.documentElement.style.background = 'transparent'")
-            page.goto(f"file://{html_path.resolve()}")
-            page.wait_for_function("window.__qween_ready === true", timeout=10_000)
-            _job_update(job_id, message="Capturing frames…", progress=5)
-            for i in range(total_frames):
-                t = req.startTime + (i / fps)
-                page.evaluate(f"window.__qween_seek({t})")
-                page.wait_for_function("window.__qween_frame_done === true", timeout=5_000)
-                page.screenshot(
-                    path=str(frames_dir / f"frame_{i:06d}.png"),
-                    clip={"x": 0, "y": 0, "width": w, "height": h},
-                    omit_background=(fmt == 'webm'),
-                )
-                pct = 5 + round((i + 1) / total_frames * 70)
-                _job_update(job_id, message=f"Frame {i+1}/{total_frames}", progress=pct)
-            browser.close()
-        fmt    = req.format if req.format in VALID_FORMATS else "mp4"
-        output = output_path_for(job_dir, fmt)
-        _job_update(job_id, message=f"Stitching to {fmt.upper()}…", progress=78)
-        input_pattern = str(frames_dir / "frame_%06d.png")
-        if fmt == "gif":
-            code, err = stitch_to_gif(input_pattern, fps, job_dir, output)
+
+        fmt          = req.format if req.format in VALID_FORMATS else "mp4"
+        scale        = max(0.5, min(req.scaleMultiplier, 4.0))
+        w            = int(req.stageWidth  * scale)
+        h            = int(req.stageHeight * scale)
+        fps          = req.fps
+        total_frames = max(1, round((req.endTime - req.startTime) * fps))
+        frames_dir   = job_dir / "frames"
+        frames_dir.mkdir()
+
+        # ── 1. Inject __qween_seek into the stage HTML ───────────────────────
+        seek_js   = _build_seek_js(req.tweensJson)
+        stage_html = req.stageHtml
+
+        # Scale the stage if scaleMultiplier > 1
+        if scale != 1.0:
+            stage_html = stage_html.replace(
+                '</style>',
+                f'#qween-stage-root{{transform:scale({scale});transform-origin:top left;}}\n'
+                f'body{{width:{w}px;height:{h}px;overflow:hidden;}}\n</style>',
+                1
+            )
+
+        # Inject seek JS just before </body>
+        seek_script = f'<script>\n{seek_js}\n</script>'
+        if '</body>' in stage_html:
+            stage_html = stage_html.replace('</body>', f'{seek_script}\n</body>', 1)
         else:
-            cfg  = FORMAT_CONFIG[fmt]
-            args = ["-framerate", str(fps), "-i", input_pattern] + cfg["codec_args"]
-            if fmt in ("mp4", "mov"): args += ["-crf", str(req.crf), "-preset", "medium"]
-            elif fmt == "webm":       args += ["-crf", str(req.crf), "-b:v", "0"]
-            args += [str(output)]
-            code, _, err = run_ffmpeg_queued(args)
-        if code != 0: raise RuntimeError(friendly_ffmpeg_error(err))
-        mb = round(output.stat().st_size / 1_048_576, 2)
-        _mark_output(job_id, fmt, mb)
-        _job_update(job_id, status="done", message=f"Done — {mb} MB",
-                    progress=100, size_mb=mb, format=fmt)
-    except Exception as e:
-        _job_update(job_id, status="error", message=str(e), progress=0)
+            stage_html += seek_script
 
-@app.post("/jobs/playwright-render")
-async def playwright_render(req: PlaywrightRenderRequest, background_tasks: BackgroundTasks):
-    job_id, job_dir = new_job(label="playwright-render")
-    _job_init(job_id, label="Playwright Render")
-    t = threading.Thread(target=_run_playwright_render, args=(job_id, req, job_dir), daemon=True)
-    t.start()
-    return {"job_id": job_id, "status": "queued", "poll_url": f"/jobs/{job_id}/status"}
-
-# ── Playwright Screen Record (new approach — loads real frame HTML) ────────────
-
-class PlaywrightRecordRequest(BaseModel):
-    stageHtml:        str
-    fps:              float = 30
-    crf:              int   = 18
-    format:           str   = "mp4"
-    duration:         float = 5.0
-    startTime:        float = 0
-    stageWidth:       float = 1080
-    stageHeight:      float = 1080
-    scaleMultiplier:  float = 1.0
-
-
-def _run_playwright_record(job_id: str, req: PlaywrightRecordRequest, job_dir: Path):
-    try:
-        from playwright.sync_api import sync_playwright
-
-        fmt = req.format if req.format in VALID_FORMATS else "mp4"
-        w   = int(req.stageWidth  * req.scaleMultiplier)
-        h   = int(req.stageHeight * req.scaleMultiplier)
-        dur = req.duration  # seconds to record
-
-        # ── 1. Write stage HTML ──────────────────────────────────────────────
         html_path = job_dir / "stage.html"
-        html_path.write_text(req.stageHtml, encoding="utf-8")
-        _job_update(job_id, status="processing", message="Launching browser…", progress=3)
+        html_path.write_text(stage_html, encoding="utf-8")
+        _job_update(job_id, status="processing", message="Launching browser…", progress=2)
 
-        rec_dir = job_dir / "recording"
-        rec_dir.mkdir()
-
+        # ── 2. Launch Playwright ─────────────────────────────────────────────
         with sync_playwright() as p:
-            # ── 2. Launch with screen recording ─────────────────────────────
             browser = p.chromium.launch(args=[
                 "--no-sandbox", "--disable-setuid-sandbox",
                 "--autoplay-policy=no-user-gesture-required",
@@ -771,96 +749,53 @@ def _run_playwright_record(job_id: str, req: PlaywrightRecordRequest, job_dir: P
                 "--disable-backgrounding-occluded-windows",
                 "--disable-renderer-backgrounding",
             ])
+            page = browser.new_page(viewport={"width": w, "height": h})
 
-            context = browser.new_context(
-                viewport={"width": w, "height": h},
-                record_video_dir=str(rec_dir),
-                record_video_size={"width": w, "height": h},
-                # For WebM: keep bg transparent
-                **({"color_scheme": "light"} if fmt == "webm" else {}),
-            )
+            # WebM: transparent background
+            if fmt == "webm":
+                page.add_init_script(
+                    "document.documentElement.style.background='transparent';"
+                    "document.body && (document.body.style.background='transparent');"
+                )
 
-            page = context.new_page()
-
-            # ── 3. Load stage ────────────────────────────────────────────────
-            _job_update(job_id, message="Loading stage…", progress=6)
             page.goto(f"file://{html_path.resolve()}")
-
-            # Wait for GSAP + videos + fonts all ready
             page.wait_for_function("window.__qween_ready === true", timeout=20_000)
-            _job_update(job_id, message="Stage ready — starting playback…", progress=10)
+            _job_update(job_id, message=f"Capturing {total_frames} frames…", progress=5)
 
-            # ── 4. Seek to startTime and play ────────────────────────────────
-            page.evaluate(f"""
-                if (window.__masterTl) {{
-                    window.__masterTl.seek({req.startTime});
-                    window.__masterTl.play();
-                }}
-            """)
-
-            # ── 5. Record for duration + small buffer ────────────────────────
-            record_ms = int(dur * 1000) + 600  # 600ms buffer for last frame
-            poll_interval = 500
-            elapsed = 0
-            while elapsed < record_ms:
-                time.sleep(poll_interval / 1000)
-                elapsed += poll_interval
-                pct = 10 + round(elapsed / record_ms * 70)
-                remaining = max(0, (record_ms - elapsed) / 1000)
+            # ── 3. Frame-by-frame capture ────────────────────────────────────
+            for i in range(total_frames):
+                t = req.startTime + (i / fps)
+                page.evaluate(f"window.__qween_seek({t})")
+                page.wait_for_function(
+                    "window.__qween_frame_done === true",
+                    timeout=8_000
+                )
+                page.screenshot(
+                    path=str(frames_dir / f"frame_{i:06d}.png"),
+                    clip={"x": 0, "y": 0, "width": w, "height": h},
+                    omit_background=(fmt == "webm"),
+                )
+                pct = 5 + round((i + 1) / total_frames * 73)
                 _job_update(job_id,
-                    message=f"Recording… {elapsed/1000:.1f}s / {dur:.1f}s ({remaining:.1f}s left)",
-                    progress=min(pct, 79))
+                    message=f"Frame {i+1}/{total_frames} · t={t:.3f}s",
+                    progress=pct)
 
-            # ── 6. Close page + context → flushes recording to disk ─────────
-            _job_update(job_id, message="Flushing recording…", progress=80)
-            page.close()
-            context.close()
             browser.close()
 
-        # ── 7. Find the recorded file ────────────────────────────────────────
-        recorded = list(rec_dir.glob("*.webm"))
-        if not recorded:
-            raise RuntimeError("Playwright did not produce a recording. Check that the stage loaded correctly.")
-        recorded_path = recorded[0]
-
-        # ── 8. Re-encode with ffmpeg for format/quality control ──────────────
-        output = output_path_for(job_dir, fmt)
-        _job_update(job_id, message=f"Encoding to {fmt.upper()}…", progress=82)
+        # ── 4. Stitch with ffmpeg ────────────────────────────────────────────
+        output        = output_path_for(job_dir, fmt)
+        input_pattern = str(frames_dir / "frame_%06d.png")
+        _job_update(job_id, message=f"Stitching {total_frames} frames → {fmt.upper()}…", progress=80)
 
         if fmt == "gif":
-            # Convert webm → PNG frames → palette GIF
-            frames_dir = job_dir / "gif_frames"
-            frames_dir.mkdir()
-            code, _, err = run_ffmpeg_queued([
-                "-i", str(recorded_path),
-                str(frames_dir / "frame_%06d.png")
-            ])
-            if code != 0: raise RuntimeError(friendly_ffmpeg_error(err))
-            code, err = stitch_to_gif(
-                str(frames_dir / "frame_%06d.png"), req.fps, job_dir, output
-            )
-        elif fmt == "webm":
-            # Re-encode as VP9 with alpha
-            code, _, err = run_ffmpeg_queued([
-                "-i", str(recorded_path),
-                "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p",
-                "-auto-alt-ref", "0",
-                "-crf", str(req.crf), "-b:v", "0",
-                str(output)
-            ])
-        elif fmt in ("mp4", "mov"):
-            cfg = FORMAT_CONFIG[fmt]
-            code, _, err = run_ffmpeg_queued([
-                "-i", str(recorded_path),
-                *cfg["codec_args"],
-                "-crf", str(req.crf), "-preset", "medium",
-                str(output)
-            ])
+            code, err = stitch_to_gif(input_pattern, fps, job_dir, output)
         else:
-            code, _, err = run_ffmpeg_queued([
-                "-i", str(recorded_path),
-                str(output)
-            ])
+            cfg  = FORMAT_CONFIG[fmt]
+            args = ["-framerate", str(fps), "-i", input_pattern] + cfg["codec_args"]
+            if fmt in ("mp4", "mov"): args += ["-crf", str(req.crf), "-preset", "medium"]
+            elif fmt == "webm":       args += ["-crf", str(req.crf), "-b:v", "0"]
+            args += [str(output)]
+            code, _, err = run_ffmpeg_queued(args)
 
         if code != 0:
             raise RuntimeError(friendly_ffmpeg_error(err))
@@ -875,16 +810,15 @@ def _run_playwright_record(job_id: str, req: PlaywrightRecordRequest, job_dir: P
         _job_update(job_id, status="error", message=str(e), progress=0)
 
 
-@app.post("/jobs/playwright-record")
-async def playwright_record(req: PlaywrightRecordRequest):
+@app.post("/jobs/playwright-render")
+async def playwright_render(req: PlaywrightRenderRequest):
     if req.format not in VALID_FORMATS:
         raise HTTPException(400, f"Invalid format. Choose from: {', '.join(sorted(VALID_FORMATS))}")
-    job_id, job_dir = new_job(label=f"screen-record → {req.format.upper()}")
-    _job_init(job_id, label=f"Screen Record → {req.format.upper()}")
-    t = threading.Thread(
-        target=_run_playwright_record,
+    job_id, job_dir = new_job(label=f"render → {req.format.upper()}")
+    _job_init(job_id, label=f"Render → {req.format.upper()}")
+    threading.Thread(
+        target=_run_playwright_render,
         args=(job_id, req, job_dir),
         daemon=True
-    )
-    t.start()
+    ).start()
     return {"job_id": job_id, "status": "queued", "poll_url": f"/jobs/{job_id}/status"}
