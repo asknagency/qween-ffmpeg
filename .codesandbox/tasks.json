@@ -10,6 +10,10 @@
       "command": "npm install -g pnpm@9.1.0"
     },
     {
+      "name": "Install web dependencies",
+      "command": "cd apps/web && pnpm install"
+    },
+    {
       "name": "Install Python deps",
       "command": "cd apps/api && pip install -r requirements.txt"
     },
