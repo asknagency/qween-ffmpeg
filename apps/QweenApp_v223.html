@@ -12813,6 +12813,159 @@ app.component('qw-node-manager-dialog', QwNodeManagerDialog);
 app.component('qw-image-picker-dialog', QwImagePickerDialog);
 app.directive('autofocus', { mounted(el) { el.focus(); } });
 app.use(ElementPlus); app.mount('#app');
+
+// ── Headless Render Mode ────────────────────────────────────────────────────
+// Activated by ?mode=render (server-side Playwright rendering).
+// Skips editor UI interaction; loads project from window.__qween_project,
+// builds the real GSAP timeline, then exposes hooks for __qween_seek.
+(async () => {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('mode') !== 'render') return;
+
+  // Hide all editor UI — only the canvas matters
+  const style = document.createElement('style');
+  style.textContent = `
+    #app > *:not(#stage-root-wrapper) { display: none !important; }
+    body { background: transparent !important; overflow: hidden !important; }
+  `;
+  document.head.appendChild(style);
+
+  // Wait for Vue to finish mounting
+  await new Promise(r => setTimeout(r, 300));
+
+  const projectData = window.__qween_project;
+  if (!projectData) {
+    console.error('[QweenRender] window.__qween_project not set.');
+    return;
+  }
+
+  // Retrieve the app's internal state via the provide/inject bridge
+  // The root app instance exposes _instance.appContext.provides
+  const appInstance = app._instance;
+  const appState = appInstance && appInstance.appContext.provides &&
+                   Object.values(appInstance.appContext.provides).find(v => v && v.nodes);
+  if (!appState) {
+    console.error('[QweenRender] Could not locate appState.');
+    return;
+  }
+
+  // Load the project using the existing restore pipeline
+  try {
+    // _applyProjectData is scoped, so we call the public path via handleProjectImport equivalent
+    // Instead, replicate the minimal restore needed for render mode:
+    const cb = appState;
+
+    // 1. Fonts — extract base64, store in fontDB, inject into SVG
+    if (projectData.fonts && projectData.fonts.length > 0) {
+      for (const f of projectData.fonts) {
+        try {
+          const byteCharacters = atob(f.base64);
+          const byteNumbers = new Array(byteCharacters.length);
+          for (let i = 0; i < byteCharacters.length; i++) byteNumbers[i] = byteCharacters.charCodeAt(i);
+          const blob = new Blob([new Uint8Array(byteNumbers)], { type: 'font/ttf' });
+          const fontObj = { ...f, base64: undefined, blob: Vue.markRaw(blob), dataUrl: URL.createObjectURL(blob) };
+          await fontDB.put(fontObj);
+        } catch(e) { console.warn('[QweenRender] Font load failed:', f.family, e); }
+      }
+      cb.setLocalFonts(await fontDB.getAll());
+    }
+
+    // 2. Set all project state
+    if (cb.getMasterCtx()) cb.getMasterCtx().revert();
+    cb.setMasterCtx(null);
+    cb.setTweens(projectData.tweens || []);
+    cb.setEffects(projectData.effects || []);
+    cb.setTemplates(projectData.templates || []);
+    cb.setSwapTemplates(projectData.swapTemplates || []);
+    cb.setStoredInitialStates(projectData.initialStates || []);
+    cb.setGlobalDataSources(projectData.globalDataSources || []);
+    cb.setTimelineLoop(!!projectData.timelineLoop);
+    cb.setTimelineYoyo(!!projectData.timelineYoyo);
+    cb.setTimelineReverse(!!projectData.timelineReverse);
+
+    // 3. Restore nodes
+    if (projectData.nodes && projectData.nodes.length > 0) {
+      const restoredNodes = [];
+      const restoredTree  = [];
+      for (const saved of projectData.nodes) {
+        const nodeType = saved.type || 'svg';
+        const node = {
+          id: saved.id, type: nodeType, width: saved.width, height: saved.height,
+          zIndex: saved.zIndex, visible: saved.visible !== false, slots: [],
+          _svgContent: '', _videoContent: { src: '', mimeType: '', poster: '' },
+          _textContent: { html: '', raw: '', tag: 'h1', style: {} }
+        };
+        if (nodeType === 'video') {
+          const vc = saved._videoContent || {};
+          const savedSlots = (saved._videoSlots && saved._videoSlots.length) ? saved._videoSlots : [vc];
+          node._videoSlots = savedSlots.map((s, si) => ({
+            src: s.src || '', mimeType: s.mimeType || '', poster: s.poster || '',
+            _treeId: s._treeId || (saved.id.replace(/^node-/, 'n') + '_video-' + (si + 1)),
+            _dbId: s._dbId || null, _label: s._label || '', _githubPath: s._githubPath || null,
+            _duration: (s._duration && isFinite(s._duration)) ? parseFloat(s._duration.toFixed(3)) : null
+          }));
+          node._videoContent = node._videoSlots[0];
+          const videoChildren = node._videoSlots.map(s => ({ id: s._treeId, label: s._treeId, tag: 'video', isSplit: false, children: [] }));
+          restoredTree.push({ id: saved.id, label: `${saved.id} [video]`, tag: 'node', isSplit: false, children: videoChildren });
+        } else if (nodeType === 'text') {
+          node._textContent = JSON.parse(JSON.stringify(saved._textContent || {}));
+          const textId = (saved._textContent && saved._textContent._treeId) || (saved.id + '_text');
+          restoredTree.push({ id: saved.id, label: `${saved.id} [text]`, tag: 'node', isSplit: false, children: [{ id: textId, label: textId, tag: (saved._textContent && saved._textContent.tag) || 'h1', isSplit: false, children: [] }] });
+        } else {
+          node._svgContent = saved._svgContent || '';
+          let svgRootId = saved.id + '_root';
+          let svgInnerChildren = [];
+          if (node._svgContent) {
+            try {
+              const parser = new DOMParser();
+              const doc = parser.parseFromString(node._svgContent, 'image/svg+xml');
+              const svgEl = doc.documentElement;
+              if (svgEl && svgEl.tagName.toLowerCase() === 'svg') {
+                svgRootId = svgEl.id || svgRootId;
+                svgInnerChildren = buildTreeFromDOM(svgEl);
+                cb.rootSvgId.value = svgEl.id || 'main-svg-root';
+                const vb = svgEl.getAttribute('viewBox');
+                if (vb) {
+                  const parts = vb.split(/\s+|,/);
+                  const vbObj = { x: parseFloat(parts[0]), y: parseFloat(parts[1]), w: parseFloat(parts[2]), h: parseFloat(parts[3]) };
+                  Object.assign(cb.plugins, { vb: { ...cb.plugins.vb, ...vbObj } });
+                  Object.assign(cb.originalViewBox, vbObj);
+                }
+              }
+            } catch(e) {}
+          }
+          restoredTree.push({ id: saved.id, label: saved.id, tag: 'node', isSplit: false, children: [{ id: svgRootId, label: svgRootId, tag: 'svg', isSplit: false, children: svgInnerChildren }] });
+        }
+        restoredNodes.push(node);
+      }
+      cb.nodes.value = restoredNodes;
+      cb.treeData.value = restoredTree;
+    }
+
+    await Vue.nextTick();
+    await new Promise(r => setTimeout(r, 200));
+
+    cb.injectFontsToSVG();
+    cb.applyStoredStates();
+
+    await Vue.nextTick();
+    await new Promise(r => setTimeout(r, 100));
+
+    // 4. Build the real GSAP timeline
+    cb.playTimeline();
+    await new Promise(r => setTimeout(r, 50));
+    if (cb.timelineInstance.value) cb.timelineInstance.value.pause(0);
+
+    // 5. Expose hooks for __qween_seek
+    window.__masterTl = cb.timelineInstance.value;
+    window.__qween_container = document.querySelector('.frame') || document.getElementById('app');
+    window.__qween_ready = true;
+
+    console.log('[QweenRender] Ready. Timeline duration:', window.__masterTl && window.__masterTl.duration());
+  } catch(e) {
+    console.error('[QweenRender] Boot failed:', e);
+  }
+})();
 </script>
 <script type="text/x-template" id="tpl-qw-expr-input">
 <div class="qw-expr-wrap" ref="wrapEl">

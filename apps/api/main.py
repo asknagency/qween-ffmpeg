@@ -608,13 +608,13 @@ def job_status(job_id: str):
 
 
 # ── Playwright Frame-by-Frame Render ──────────────────────────────────────────
-# Single consolidated render endpoint — server-side frame capture with
-# full _videoPlayConfig support. Replaces both playwright-render and
-# playwright-record. Accepts a self-contained stageHtml + tweens JSON.
+# Headless render mode: ships QweenApp_v223.html to Playwright, injects
+# projectJson so the real GSAP timeline is built — no second implementation.
+
+QWEEN_APP_PATH = Path(__file__).parent.parent / "QweenApp_v223.html"
 
 class PlaywrightRenderRequest(BaseModel):
-    stageHtml:        str                  # self-contained HTML of the live frame
-    tweensJson:       str         = "[]"   # serialized tweens array for __qween_seek
+    projectJson:      dict                 # full project.json object
     fps:              float       = 30
     crf:              int         = 18
     format:           str         = "mp4"
@@ -625,85 +625,80 @@ class PlaywrightRenderRequest(BaseModel):
     scaleMultiplier:  float       = 1.0
 
 
-def _build_seek_js(tweens_json: str) -> str:
+def _extract_fonts(project: dict, job_dir: Path) -> dict:
     """
-    Build the __qween_seek JS function injected into the stage HTML.
-    Handles:
-      - GSAP timeline seek
-      - video element currentTime via seeked event
-      - _videoPlayConfig: maps timeline position t → videoEl.currentTime
+    Extract base64 fonts from project.json, write to disk, return
+    a mapping of { blob_url_placeholder → file:// URL } for rewriting.
+    Fonts are always mandatory — runs unconditionally before page load.
     """
-    return f"""
-window.__qween_tweens = {tweens_json};
-window.__qween_ready = false;
+    fonts_dir = job_dir / "fonts"
+    fonts_dir.mkdir(exist_ok=True)
+    font_css_lines = []
+
+    for font in project.get("fonts", []):
+        try:
+            b64   = font.get("base64", "")
+            if not b64:
+                continue
+            fname = f"{font.get('id', 'font')}.{font.get('format', 'ttf')}"
+            fpath = fonts_dir / fname
+            fpath.write_bytes(__import__("base64").b64decode(b64))
+            family    = font.get("family", "UnknownFont")
+            weight    = font.get("weight", "normal")
+            style     = font.get("style", "normal")
+            fmt_name  = font.get("format", "truetype")
+            file_url  = fpath.resolve().as_uri()
+            font_css_lines.append(
+                f"@font-face {{ font-family: '{family}'; font-weight: {weight}; "
+                f"font-style: {style}; src: url('{file_url}') format('{fmt_name}'); }}"
+            )
+        except Exception as e:
+            print(f"[QweenRender] Font extraction failed for {font.get('family')}: {e}")
+
+    return "\n".join(font_css_lines)
+
+
+def _build_seek_js() -> str:
+    """
+    Simplified __qween_seek — now backed by the real GSAP timeline
+    exposed by QweenApp's headless render mode as window.__masterTl.
+    """
+    return """
 window.__qween_frame_done = false;
 
-// Resolve videoPlayConfig currentTime for a given timeline position t
-window.__resolve_vpc_time = function(t) {{
-  const tweens = window.__qween_tweens || [];
-  const vpc_map = {{}};  // slotId → currentTime
-  for (const tw of tweens) {{
-    if (!tw._videoPlayConfig) continue;
-    const vpc   = tw._videoPlayConfig;
-    const pos   = parseFloat(tw.position) || 0;
-    const dur   = parseFloat(tw.timingVars && tw.timingVars.duration || tw.duration || 1);
-    const tween_end = pos + dur;
-    if (t < pos || t > tween_end) continue;
-    const progress  = dur > 0 ? (t - pos) / dur : 0;
-    const vt = vpc.fromTime + progress * (vpc.toTime - vpc.fromTime);
-    vpc_map[vpc.slotId] = Math.max(vpc.fromTime, Math.min(vpc.toTime, vt));
-  }}
-  return vpc_map;
-}};
-
-window.__qween_seek = async function(t) {{
+window.__qween_seek = async function(t) {
   window.__qween_frame_done = false;
 
-  // 1. Seek GSAP timeline
-  if (window.__masterTl) {{
+  // 1. Seek the real GSAP timeline exposed by QweenApp headless boot
+  if (window.__masterTl) {
     window.__masterTl.pause();
     window.__masterTl.time(t);
-  }}
+  }
 
-  // 2. Resolve _videoPlayConfig times for this t
-  const vpc_map = window.__resolve_vpc_time(t);
-
-  // 3. Seek all video elements — both timeline-driven and vpc-driven
+  // 2. Seek any video elements present in the canvas
   const videos = Array.from(document.querySelectorAll('video'));
-  const seekPromises = videos.map(v => new Promise(res => {{
-    if (!v.src) {{ res(); return; }}
+  const seekPromises = videos.map(v => new Promise(res => {
+    if (!v.src) { res(); return; }
     v.pause();
-    // Determine target currentTime
-    const vpc_t = vpc_map[v.id];
-    const target = (vpc_t !== undefined) ? vpc_t : t;
-    if (Math.abs(v.currentTime - target) < 0.001) {{ res(); return; }}
-    const onSeeked = () => {{ v.removeEventListener('seeked', onSeeked); res(); }};
+    if (Math.abs(v.currentTime - t) < 0.001) { res(); return; }
+    const onSeeked = () => { v.removeEventListener('seeked', onSeeked); res(); };
     v.addEventListener('seeked', onSeeked);
-    v.currentTime = target;
-    setTimeout(res, 300); // safety timeout
-  }}));
+    v.currentTime = t;
+    setTimeout(res, 300);
+  }));
   await Promise.all(seekPromises);
 
-  // 4. Wait two rAF cycles for paint
+  // 3. Two rAF cycles for paint to settle
   await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
   window.__qween_frame_done = true;
-}};
-
-// Wait for all video elements ready, then signal __qween_ready
-const _videos = Array.from(document.querySelectorAll('video'));
-Promise.all(_videos.map(v => new Promise(res => {{
-  if (!v.src) {{ res(); return; }}
-  if (v.readyState >= 2) {{ res(); return; }}
-  v.addEventListener('canplay', res, {{ once: true }});
-  v.addEventListener('error',   res, {{ once: true }});
-  setTimeout(res, 5000);
-}}))).then(() => {{ window.__qween_ready = true; }});
+};
 """
 
 
 def _run_playwright_render(job_id: str, req: PlaywrightRenderRequest, job_dir: Path):
     try:
         from playwright.sync_api import sync_playwright
+        import json as _json
 
         fmt          = req.format if req.format in VALID_FORMATS else "mp4"
         scale        = max(0.5, min(req.scaleMultiplier, 4.0))
@@ -714,31 +709,60 @@ def _run_playwright_render(job_id: str, req: PlaywrightRenderRequest, job_dir: P
         frames_dir   = job_dir / "frames"
         frames_dir.mkdir()
 
-        # ── 1. Inject __qween_seek into the stage HTML ───────────────────────
-        seek_js   = _build_seek_js(req.tweensJson)
-        stage_html = req.stageHtml
+        # ── 1. Read QweenApp_v223.html from repo ─────────────────────────────
+        if not QWEEN_APP_PATH.exists():
+            raise FileNotFoundError(
+                f"QweenApp_v223.html not found at {QWEEN_APP_PATH}. "
+                "Ensure it is committed to apps/QweenApp_v223.html in the repo."
+            )
+        app_html = QWEEN_APP_PATH.read_text(encoding="utf-8")
 
-        # Scale the stage if scaleMultiplier > 1
+        # ── 2. Font pipeline (mandatory — always runs before page load) ───────
+        font_css = _extract_fonts(req.projectJson, job_dir)
+
+        # ── 3. Build render-mode HTML ─────────────────────────────────────────
+        # Inject: font CSS overrides + projectJson + seek JS + scale
+        project_json_str = _json.dumps(req.projectJson)
+        seek_js          = _build_seek_js()
+
+        inject_head = f"""
+<style id="__qween_font_overrides">
+{font_css}
+</style>
+<script id="__qween_project_inject">
+  window.__qween_project = {project_json_str};
+</script>"""
+
+        inject_body = f"""
+<script id="__qween_seek_inject">
+{seek_js}
+</script>"""
+
+        # Scale the canvas if needed
         if scale != 1.0:
-            stage_html = stage_html.replace(
-                '</style>',
-                f'#qween-stage-root{{transform:scale({scale});transform-origin:top left;}}\n'
-                f'body{{width:{w}px;height:{h}px;overflow:hidden;}}\n</style>',
-                1
+            inject_head += (
+                f'\n<style id="__qween_scale">'
+                f'.frame{{transform:scale({scale});transform-origin:top left;}}'
+                f'body{{width:{w}px;height:{h}px;overflow:hidden;}}'
+                f'</style>'
             )
 
-        # Inject seek JS just before </body>
-        seek_script = f'<script>\n{seek_js}\n</script>'
-        if '</body>' in stage_html:
-            stage_html = stage_html.replace('</body>', f'{seek_script}\n</body>', 1)
+        # Inject into the real app HTML
+        if '</head>' in app_html:
+            app_html = app_html.replace('</head>', f'{inject_head}\n</head>', 1)
         else:
-            stage_html += seek_script
+            app_html = inject_head + app_html
+
+        if '</body>' in app_html:
+            app_html = app_html.replace('</body>', f'{inject_body}\n</body>', 1)
+        else:
+            app_html += inject_body
 
         html_path = job_dir / "stage.html"
-        html_path.write_text(stage_html, encoding="utf-8")
+        html_path.write_text(app_html, encoding="utf-8")
         _job_update(job_id, status="processing", message="Launching browser…", progress=2)
 
-        # ── 2. Launch Playwright ─────────────────────────────────────────────
+        # ── 4. Launch Playwright ──────────────────────────────────────────────
         with sync_playwright() as p:
             browser = p.chromium.launch(args=[
                 "--no-sandbox", "--disable-setuid-sandbox",
@@ -758,11 +782,26 @@ def _run_playwright_render(job_id: str, req: PlaywrightRenderRequest, job_dir: P
                     "document.body && (document.body.style.background='transparent');"
                 )
 
-            page.goto(f"file://{html_path.resolve()}")
-            page.wait_for_function("window.__qween_ready === true", timeout=20_000)
+            # Load with ?mode=render so QweenApp boots headlessly
+            page.goto(f"file://{html_path.resolve()}?mode=render")
+
+            # Wait for QweenApp to finish building the timeline
+            page.wait_for_function("window.__qween_ready === true", timeout=45_000)
             _job_update(job_id, message=f"Capturing {total_frames} frames…", progress=5)
 
-            # ── 3. Frame-by-frame capture ────────────────────────────────────
+            # Resolve the canvas bounding box for screenshot clip
+            clip = page.evaluate("""() => {
+                const el = window.__qween_container
+                         || document.querySelector('.frame')
+                         || document.body;
+                const r = el.getBoundingClientRect();
+                return { x: Math.round(r.x), y: Math.round(r.y),
+                         width: Math.round(r.width), height: Math.round(r.height) };
+            }""")
+            if not clip or clip["width"] == 0:
+                clip = {"x": 0, "y": 0, "width": w, "height": h}
+
+            # ── 5. Frame-by-frame capture ─────────────────────────────────────
             for i in range(total_frames):
                 t = req.startTime + (i / fps)
                 page.evaluate(f"window.__qween_seek({t})")
@@ -772,7 +811,7 @@ def _run_playwright_render(job_id: str, req: PlaywrightRenderRequest, job_dir: P
                 )
                 page.screenshot(
                     path=str(frames_dir / f"frame_{i:06d}.png"),
-                    clip={"x": 0, "y": 0, "width": w, "height": h},
+                    clip=clip,
                     omit_background=(fmt == "webm"),
                 )
                 pct = 5 + round((i + 1) / total_frames * 73)
