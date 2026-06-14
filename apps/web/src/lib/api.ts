@@ -187,3 +187,12 @@ export interface JobRecord {
 export async function listJobs(base = DEFAULT_BASE): Promise<{ jobs: JobRecord[] }> {
   return apiFetch(`${base}/jobs`, { method: 'GET' }, 'Could not fetch jobs')
 }
+
+// ── Job status (for log viewer) ───────────────────────────────────────────────
+export interface JobStatus {
+  status: string; message: string; progress: number
+  label?: string; size_mb?: number | null; format?: string | null
+}
+export async function getJobStatus(jobId: string, base = DEFAULT_BASE): Promise<JobStatus> {
+  return apiFetch(`${base}/jobs/${jobId}/status`, { method: 'GET' }, 'Could not fetch status')
+}
