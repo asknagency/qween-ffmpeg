@@ -795,11 +795,22 @@ def _run_playwright_render(job_id: str, req: PlaywrightRenderRequest, job_dir: P
                     "document.body && (document.body.style.background='transparent');"
                 )
 
+            # Capture all browser console output and page errors for debugging
+            browser_logs = []
+            page.on("console", lambda msg: browser_logs.append(f"[{msg.type}] {msg.text}"))
+            page.on("pageerror", lambda err: browser_logs.append(f"[pageerror] {err}"))
+
             # Load over HTTP so CDN scripts (GSAP, Vue, ElementPlus) load correctly
             page.goto(f"http://127.0.0.1:{http_port}/stage.html?mode=render")
 
             # Wait for QweenApp to finish building the timeline
-            page.wait_for_function("window.__qween_ready === true", timeout=45_000)
+            try:
+                page.wait_for_function("window.__qween_ready === true", timeout=45_000)
+            except Exception as wait_err:
+                log_dump = "\n".join(browser_logs[-40:]) if browser_logs else "(no browser logs)"
+                raise RuntimeError(
+                    f"__qween_ready timeout.\n--- Browser logs ---\n{log_dump}"
+                ) from wait_err
             _job_update(job_id, message=f"Capturing {total_frames} frames…", progress=5)
 
             # Resolve the canvas bounding box for screenshot clip
