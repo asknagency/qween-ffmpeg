@@ -12720,7 +12720,8 @@ app.use(ElementPlus); app.mount('#app');
   // The root app instance exposes _instance.appContext.provides
   const appInstance = app._instance;
   const appState = appInstance && appInstance.appContext.provides &&
-                   Object.values(appInstance.appContext.provides).find(v => v && v.nodes);
+                   (appInstance.appContext.provides['appState'] ||
+                    Object.values(appInstance.appContext.provides).find(v => v && v.nodes));
   if (!appState) {
     console.error('[QweenRender] Could not locate appState.');
     return;
