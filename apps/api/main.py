@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 # ── App setup ─────────────────────────────────────────────────────────────────
-app = FastAPI(title="QweenFFmpeg API", version="3.0.0")
+app = FastAPI(title="QweenFFmpeg API", version="4.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 WORK_DIR         = Path(tempfile.gettempdir()) / "qween_ffmpeg"
@@ -208,7 +208,7 @@ def health():
     line = r.stdout.splitlines()[0] if r.stdout else "unknown"
     total_mb = sum(f.stat().st_size for f in WORK_DIR.rglob("*") if f.is_file()) / 1_048_576
     queue_busy = not _ffmpeg_sem._value  # 0 = busy, 1 = free
-    return {"status": "ok", "ffmpeg": line, "version": "2.2.0",
+    return {"status": "ok", "ffmpeg": line, "version": "4.0.0",
             "active_jobs": len(list(WORK_DIR.iterdir())),
             "storage_used_mb": round(total_mb, 1),
             "queue_busy": queue_busy,
@@ -607,290 +607,187 @@ def job_status(job_id: str):
             "progress": 100 if has_output else 0}
 
 
-# ── Playwright Frame-by-Frame Render ──────────────────────────────────────────
-# Headless render mode: ships QweenApp_v223.html to Playwright, injects
-# projectJson so the real GSAP timeline is built — no second implementation.
+# ── Alpha WebM (dual-stream alphamerge) ───────────────────────────────────────
+# Client encodes two opaque streams via WebCodecs: RGB color, and alpha
+# repacked into the Y plane of a second I420 stream (U/V neutral, 128).
+# ffmpeg combines them into a single yuva420p WebM via the alphamerge filter.
+@app.post("/jobs/alphamerge")
+async def alphamerge(
+    color: UploadFile = File(...),
+    alpha: UploadFile = File(...),
+    fps: float = Form(30),
+    crf: int = Form(18),
+):
+    job_id, job_dir = new_job(label="alphamerge → webm")
+    color_path = job_dir / f"color{Path(color.filename).suffix or '.mp4'}"
+    alpha_path = job_dir / f"alpha{Path(alpha.filename).suffix or '.mp4'}"
+    async with aiofiles.open(color_path, "wb") as f: await f.write(await color.read())
+    async with aiofiles.open(alpha_path, "wb") as f: await f.write(await alpha.read())
 
-QWEEN_APP_PATH = Path(__file__).parent.parent / "QweenApp_v223.html"
-
-class PlaywrightRenderRequest(BaseModel):
-    projectJson:      dict                 # full project.json object
-    fps:              float       = 30
-    crf:              int         = 18
-    format:           str         = "mp4"
-    startTime:        float       = 0
-    endTime:          float       = 5.0
-    stageWidth:       float       = 1080
-    stageHeight:      float       = 1080
-    scaleMultiplier:  float       = 1.0
-
-
-def _extract_fonts(project: dict, job_dir: Path) -> dict:
-    """
-    Extract base64 fonts from project.json, write to disk, return
-    a mapping of { blob_url_placeholder → file:// URL } for rewriting.
-    Fonts are always mandatory — runs unconditionally before page load.
-    """
-    fonts_dir = job_dir / "fonts"
-    fonts_dir.mkdir(exist_ok=True)
-    font_css_lines = []
-
-    for font in project.get("fonts", []):
-        try:
-            b64   = font.get("base64", "")
-            if not b64:
-                continue
-            fname = f"{font.get('id', 'font')}.{font.get('format', 'ttf')}"
-            fpath = fonts_dir / fname
-            fpath.write_bytes(__import__("base64").b64decode(b64))
-            family    = font.get("family", "UnknownFont")
-            weight    = font.get("weight", "normal")
-            style     = font.get("style", "normal")
-            fmt_name  = font.get("format", "truetype")
-            file_url  = fpath.resolve().as_uri()
-            font_css_lines.append(
-                f"@font-face {{ font-family: '{family}'; font-weight: {weight}; "
-                f"font-style: {style}; src: url('{file_url}') format('{fmt_name}'); }}"
-            )
-        except Exception as e:
-            print(f"[QweenRender] Font extraction failed for {font.get('family')}: {e}")
-
-    return "\n".join(font_css_lines)
+    output = output_path_for(job_dir, "webm")
+    code, _, err = run_ffmpeg_queued([
+        "-i", str(color_path), "-i", str(alpha_path),
+        "-filter_complex", "[0:v][1:v]alphamerge=shortest=1",
+        "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p",
+        "-auto-alt-ref", "0", "-crf", str(crf), "-b:v", "0",
+        "-r", str(fps),
+        str(output)
+    ])
+    if code != 0:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(400, f"alphamerge failed: {friendly_ffmpeg_error(err)}")
+    return build_result(job_dir, job_id, "webm")
 
 
-def _build_seek_js() -> str:
-    """
-    Simplified __qween_seek — now backed by the real GSAP timeline
-    exposed by QweenApp's headless render mode as window.__masterTl.
-    """
-    return """
-window.__qween_frame_done = false;
+# ── GIF from already-encoded opaque video ─────────────────────────────────────
+# Reuses the client's WebCodecs-encoded opaque MP4 as ffmpeg's sole input for
+# palettegen/paletteuse — one small upload, one ffmpeg invocation.
+@app.post("/jobs/gif-from-video")
+async def gif_from_video(
+    file: UploadFile = File(...),
+    fps: float = Form(15),
+    width: Optional[int] = Form(None),
+):
+    job_id, job_dir = new_job(label="gif-from-video")
+    suffix = Path(file.filename).suffix or ".mp4"
+    input_path = job_dir / f"input{suffix}"
+    async with aiofiles.open(input_path, "wb") as f: await f.write(await file.read())
 
-window.__qween_seek = async function(t) {
-  window.__qween_frame_done = false;
-
-  // 1. Seek the real GSAP timeline exposed by QweenApp headless boot
-  if (window.__masterTl) {
-    window.__masterTl.pause();
-    window.__masterTl.time(t);
-  }
-
-  // 2. Seek any video elements present in the canvas
-  const videos = Array.from(document.querySelectorAll('video'));
-  const seekPromises = videos.map(v => new Promise(res => {
-    if (!v.src) { res(); return; }
-    v.pause();
-    if (Math.abs(v.currentTime - t) < 0.001) { res(); return; }
-    const onSeeked = () => { v.removeEventListener('seeked', onSeeked); res(); };
-    v.addEventListener('seeked', onSeeked);
-    v.currentTime = t;
-    setTimeout(res, 300);
-  }));
-  await Promise.all(seekPromises);
-
-  // 3. Two rAF cycles for paint to settle
-  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-  window.__qween_frame_done = true;
-};
-"""
+    output = output_path_for(job_dir, "gif")
+    palette = job_dir / "palette.png"
+    vf_base = f"fps={fps},scale={width}:-1:flags=lanczos" if width else f"fps={fps},scale=320:-1:flags=lanczos"
+    c1, _, e1 = run_ffmpeg_queued(["-i", str(input_path), "-vf", f"{vf_base},palettegen", str(palette)])
+    if c1 != 0:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(400, f"GIF encode failed: {friendly_ffmpeg_error(e1)}")
+    c2, _, e2 = run_ffmpeg_queued(["-i", str(input_path), "-i", str(palette),
+                                    "-lavfi", f"{vf_base} [x]; [x][1:v] paletteuse",
+                                    str(output)])
+    if c2 != 0:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(400, f"GIF encode failed: {friendly_ffmpeg_error(e2)}")
+    return build_result(job_dir, job_id, "gif")
 
 
-def _run_playwright_render(job_id: str, req: PlaywrightRenderRequest, job_dir: Path):
-    try:
-        from playwright.sync_api import sync_playwright
-        import json as _json
+# ── Audio mux / mix ────────────────────────────────────────────────────────────
+# Combine a silent WebCodecs-encoded video with one or more audio sources.
+# Video stream is copied (no re-encode); trim/loop/fade/mix handled via
+# ffmpeg's filter graph (atrim, aloop, afade, amix, adelay).
+class AudioTrack(BaseModel):
+    delay_ms:    float = 0      # adelay
+    trim_start:  Optional[float] = None  # atrim start (seconds)
+    trim_end:    Optional[float] = None  # atrim end (seconds)
+    loop:        bool  = False  # aloop to match video duration
+    fade_in:     float = 0      # afade in duration (seconds)
+    fade_out:    float = 0      # afade out duration (seconds)
+    volume:      float = 1.0
 
-        fmt          = req.format if req.format in VALID_FORMATS else "mp4"
-        scale        = max(0.5, min(req.scaleMultiplier, 4.0))
-        w            = int(req.stageWidth  * scale)
-        h            = int(req.stageHeight * scale)
-        fps          = req.fps
-        total_frames = max(1, round((req.endTime - req.startTime) * fps))
-        frames_dir   = job_dir / "frames"
-        frames_dir.mkdir()
+@app.post("/jobs/mux-audio/{video_job_id}")
+async def mux_audio(
+    video_job_id: str,
+    output_format: str = Form("mp4"),
+    audio_files: List[UploadFile] = File(...),
+    delay_ms:    str = Form(""),    # comma-separated, parallel to audio_files
+    trim_start:  str = Form(""),
+    trim_end:    str = Form(""),
+    loop:        str = Form(""),
+    fade_in:     str = Form(""),
+    fade_out:    str = Form(""),
+    volume:      str = Form(""),
+):
+    if output_format not in VALID_VIDEO_FORMATS:
+        raise HTTPException(400, f"Invalid format. Choose from: {', '.join(sorted(VALID_VIDEO_FORMATS))}")
 
-        # ── 1. Read QweenApp_v223.html from repo ─────────────────────────────
-        if not QWEEN_APP_PATH.exists():
-            raise FileNotFoundError(
-                f"QweenApp_v223.html not found at {QWEEN_APP_PATH}. "
-                "Ensure it is committed to apps/QweenApp_v223.html in the repo."
-            )
-        app_html = QWEEN_APP_PATH.read_text(encoding="utf-8")
+    src_job_dir = WORK_DIR / video_job_id
+    src_video = None
+    for cfg in FORMAT_CONFIG.values():
+        p = src_job_dir / f"output{cfg['ext']}"
+        if p.exists():
+            src_video = p
+            break
+    if src_video is None:
+        raise HTTPException(404, "Source video job not found or has no output.")
 
-        # ── 2. Font pipeline (mandatory — always runs before page load) ───────
-        font_css = _extract_fonts(req.projectJson, job_dir)
+    job_id, job_dir = new_job(label=f"mux-audio → {output_format.upper()}")
 
-        # ── 3. Build render-mode HTML ─────────────────────────────────────────
-        # Inject: font CSS overrides + projectJson + seek JS + scale
-        project_json_str = _json.dumps(req.projectJson)
-        seek_js          = _build_seek_js()
+    def _split(csv: str, n: int, default, caster):
+        parts = [p.strip() for p in csv.split(",")] if csv else []
+        out = []
+        for i in range(n):
+            out.append(caster(parts[i]) if i < len(parts) and parts[i] != "" else default)
+        return out
 
-        inject_head = f"""
-<style id="__qween_font_overrides">
-{font_css}
-</style>
-<script id="__qween_project_inject">
-  window.__qween_project = {project_json_str};
-</script>"""
+    n = len(audio_files)
+    delays  = _split(delay_ms,   n, 0,    float)
+    starts  = _split(trim_start, n, None, to_float)
+    ends    = _split(trim_end,   n, None, to_float)
+    loops   = _split(loop,       n, False, lambda v: v.lower() in ("1","true","yes"))
+    fadeins = _split(fade_in,    n, 0,    float)
+    fadeouts= _split(fade_out,   n, 0,    float)
+    vols    = _split(volume,     n, 1.0,  float)
 
-        inject_body = f"""
-<script id="__qween_seek_inject">
-{seek_js}
-</script>"""
+    audio_paths = []
+    for i, af in enumerate(audio_files):
+        suffix = Path(af.filename).suffix or ".m4a"
+        p = job_dir / f"audio_{i}{suffix}"
+        async with aiofiles.open(p, "wb") as f: await f.write(await af.read())
+        audio_paths.append(p)
 
-        # Scale the canvas if needed
-        if scale != 1.0:
-            inject_head += (
-                f'\n<style id="__qween_scale">'
-                f'.frame{{transform:scale({scale});transform-origin:top left;}}'
-                f'body{{width:{w}px;height:{h}px;overflow:hidden;}}'
-                f'</style>'
-            )
+    vinfo = probe_video(src_video)
+    video_duration = to_float(vinfo.get("duration")) or 0
 
-        # Inject into the real app HTML
-        if '</head>' in app_html:
-            app_html = app_html.replace('</head>', f'{inject_head}\n</head>', 1)
+    args = ["-i", str(src_video)]
+    for p in audio_paths:
+        args += ["-i", str(p)]
+
+    filter_parts = []
+    mixed_labels = []
+    for i in range(n):
+        label_in = f"{i+1}:a"
+        chain = []
+        if starts[i] is not None or ends[i] is not None:
+            trim_args = []
+            if starts[i] is not None: trim_args.append(f"start={starts[i]}")
+            if ends[i] is not None:   trim_args.append(f"end={ends[i]}")
+            chain.append(f"atrim={':'.join(trim_args)}")
+            chain.append("asetpts=PTS-STARTPTS")
+        if loops[i] and video_duration:
+            chain.append(f"aloop=loop=-1:size=2e9")
+            chain.append(f"atrim=0:{video_duration}")
+            chain.append("asetpts=PTS-STARTPTS")
+        if fadeins[i] > 0:
+            chain.append(f"afade=t=in:st=0:d={fadeins[i]}")
+        if fadeouts[i] > 0 and video_duration:
+            chain.append(f"afade=t=out:st={max(0, video_duration - fadeouts[i])}:d={fadeouts[i]}")
+        if vols[i] != 1.0:
+            chain.append(f"volume={vols[i]}")
+        if delays[i] > 0:
+            chain.append(f"adelay={int(delays[i])}:all=1")
+        out_label = f"a{i}"
+        if chain:
+            filter_parts.append(f"[{label_in}]{','.join(chain)}[{out_label}]")
         else:
-            app_html = inject_head + app_html
+            filter_parts.append(f"[{label_in}]anull[{out_label}]")
+        mixed_labels.append(f"[{out_label}]")
 
-        if '</body>' in app_html:
-            app_html = app_html.replace('</body>', f'{inject_body}\n</body>', 1)
-        else:
-            app_html += inject_body
+    if n == 1:
+        final_label = mixed_labels[0]
+        filter_complex = ";".join(filter_parts)
+    else:
+        filter_parts.append(f"{''.join(mixed_labels)}amix=inputs={n}:duration=longest:dropout_transition=0[aout]")
+        final_label = "[aout]"
+        filter_complex = ";".join(filter_parts)
 
-        html_path = job_dir / "stage.html"
-        html_path.write_text(app_html, encoding="utf-8")
-        _job_update(job_id, status="processing", message="Launching browser…", progress=2)
-
-        # ── 3b. Copy vendored assets (Vue, GSAP, Element Plus, fonts, etc.) ────
-        # stage.html references ./vendor/... relative to itself; since stage.html
-        # is served from job_dir, the vendor/ directory must exist alongside it.
-        vendor_src = QWEEN_APP_PATH.parent / "vendor"
-        if vendor_src.exists():
-            shutil.copytree(vendor_src, job_dir / "vendor", dirs_exist_ok=True)
-
-        # ── 4. Spin up a local HTTP server so CDN scripts load correctly ──────
-        # file:// URLs block external CDN requests in Chromium; http:// does not.
-        import http.server, socketserver, random
-        http_port = random.randint(19000, 29000)
-        html_dir  = str(job_dir)
-
-        class _SilentHandler(http.server.SimpleHTTPRequestHandler):
-            def __init__(self, *a, **kw):
-                super().__init__(*a, directory=html_dir, **kw)
-            def log_message(self, *a): pass
-
-        httpd = socketserver.TCPServer(("127.0.0.1", http_port), _SilentHandler)
-        srv_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-        srv_thread.start()
-
-        # ── 5. Launch Playwright ──────────────────────────────────────────────
-        with sync_playwright() as p:
-            browser = p.chromium.launch(args=[
-                "--no-sandbox", "--disable-setuid-sandbox",
-                "--autoplay-policy=no-user-gesture-required",
-                "--disable-background-timer-throttling",
-                "--disable-backgrounding-occluded-windows",
-                "--disable-renderer-backgrounding",
-            ])
-            page = browser.new_page(viewport={"width": w, "height": h})
-
-            # WebM: transparent background
-            if fmt == "webm":
-                page.add_init_script(
-                    "document.documentElement.style.background='transparent';"
-                    "document.body && (document.body.style.background='transparent');"
-                )
-
-            # Capture all browser console output and page errors for debugging
-            browser_logs = []
-            page.on("console", lambda msg: browser_logs.append(f"[{msg.type}] {msg.text}"))
-            page.on("pageerror", lambda err: browser_logs.append(f"[pageerror] {err}"))
-
-            # Load over HTTP so CDN scripts (GSAP, Vue, ElementPlus) load correctly
-            page.goto(f"http://127.0.0.1:{http_port}/stage.html?mode=render")
-
-            # Wait for QweenApp to finish building the timeline
-            try:
-                page.wait_for_function("window.__qween_ready === true", timeout=45_000)
-            except Exception as wait_err:
-                log_dump = "\n".join(browser_logs[-40:]) if browser_logs else "(no browser logs)"
-                raise RuntimeError(
-                    f"__qween_ready timeout.\n--- Browser logs ---\n{log_dump}"
-                ) from wait_err
-            _job_update(job_id, message=f"Capturing {total_frames} frames…", progress=5)
-
-            # Resolve the canvas bounding box for screenshot clip
-            clip = page.evaluate("""() => {
-                const el = window.__qween_container
-                         || document.querySelector('.frame')
-                         || document.body;
-                const r = el.getBoundingClientRect();
-                return { x: Math.round(r.x), y: Math.round(r.y),
-                         width: Math.round(r.width), height: Math.round(r.height) };
-            }""")
-            if not clip or clip["width"] == 0:
-                clip = {"x": 0, "y": 0, "width": w, "height": h}
-
-            # ── 5. Frame-by-frame capture ─────────────────────────────────────
-            for i in range(total_frames):
-                t = req.startTime + (i / fps)
-                page.evaluate(f"window.__qween_seek({t})")
-                page.wait_for_function(
-                    "window.__qween_frame_done === true",
-                    timeout=8_000
-                )
-                page.screenshot(
-                    path=str(frames_dir / f"frame_{i:06d}.png"),
-                    clip=clip,
-                    omit_background=(fmt == "webm"),
-                )
-                pct = 5 + round((i + 1) / total_frames * 73)
-                _job_update(job_id,
-                    message=f"Frame {i+1}/{total_frames} · t={t:.3f}s",
-                    progress=pct)
-
-            browser.close()
-
-        httpd.shutdown()
-
-        # ── 4. Stitch with ffmpeg ────────────────────────────────────────────
-        output        = output_path_for(job_dir, fmt)
-        input_pattern = str(frames_dir / "frame_%06d.png")
-        _job_update(job_id, message=f"Stitching {total_frames} frames → {fmt.upper()}…", progress=80)
-
-        if fmt == "gif":
-            code, err = stitch_to_gif(input_pattern, fps, job_dir, output)
-        else:
-            cfg  = FORMAT_CONFIG[fmt]
-            args = ["-framerate", str(fps), "-i", input_pattern] + cfg["codec_args"]
-            if fmt in ("mp4", "mov"): args += ["-crf", str(req.crf), "-preset", "medium"]
-            elif fmt == "webm":       args += ["-crf", str(req.crf), "-b:v", "0"]
-            args += [str(output)]
-            code, _, err = run_ffmpeg_queued(args)
-
-        if code != 0:
-            raise RuntimeError(friendly_ffmpeg_error(err))
-
-        mb = round(output.stat().st_size / 1_048_576, 2)
-        _mark_output(job_id, fmt, mb)
-        _job_update(job_id, status="done",
-                    message=f"Done — {mb} MB · {fmt.upper()}",
-                    progress=100, size_mb=mb, format=fmt)
-
-    except Exception as e:
-        _job_update(job_id, status="error", message=str(e), progress=0)
-
-
-@app.post("/jobs/playwright-render")
-async def playwright_render(req: PlaywrightRenderRequest):
-    if req.format not in VALID_FORMATS:
-        raise HTTPException(400, f"Invalid format. Choose from: {', '.join(sorted(VALID_FORMATS))}")
-    job_id, job_dir = new_job(label=f"render → {req.format.upper()}")
-    _job_init(job_id, label=f"Render → {req.format.upper()}")
-    threading.Thread(
-        target=_run_playwright_render,
-        args=(job_id, req, job_dir),
-        daemon=True
-    ).start()
-    return {"job_id": job_id, "status": "queued", "poll_url": f"/jobs/{job_id}/status"}
+    audio_codec = "libopus" if output_format == "webm" else "aac"
+    output = output_path_for(job_dir, output_format)
+    args += [
+        "-filter_complex", filter_complex,
+        "-map", "0:v", "-map", final_label,
+        "-c:v", "copy", "-c:a", audio_codec, "-shortest",
+        str(output)
+    ]
+    code, _, err = run_ffmpeg_queued(args)
+    if code != 0:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(400, f"Audio mux failed: {friendly_ffmpeg_error(err)}")
+    return build_result(job_dir, job_id, output_format)
