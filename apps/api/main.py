@@ -762,6 +762,13 @@ def _run_playwright_render(job_id: str, req: PlaywrightRenderRequest, job_dir: P
         html_path.write_text(app_html, encoding="utf-8")
         _job_update(job_id, status="processing", message="Launching browser…", progress=2)
 
+        # ── 3b. Copy vendored assets (Vue, GSAP, Element Plus, fonts, etc.) ────
+        # stage.html references ./vendor/... relative to itself; since stage.html
+        # is served from job_dir, the vendor/ directory must exist alongside it.
+        vendor_src = QWEEN_APP_PATH.parent / "vendor"
+        if vendor_src.exists():
+            shutil.copytree(vendor_src, job_dir / "vendor", dirs_exist_ok=True)
+
         # ── 4. Spin up a local HTTP server so CDN scripts load correctly ──────
         # file:// URLs block external CDN requests in Chromium; http:// does not.
         import http.server, socketserver, random
