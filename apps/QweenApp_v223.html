@@ -7730,7 +7730,6 @@ const isRendering = Vue.computed(() => isRenderingSvg.value || isRenderingVideo.
 
 const startRender = async () => {
   if (!renderServerUrl.value) { ElMessage.warning('Set a render server URL first.'); return; }
-  if (!cb.timelineInstance.value) { ElMessage.warning('No timeline found.'); return; }
 
   isRenderingVideo.value = true;
   renderDownloadUrl.value = '';
@@ -7738,152 +7737,30 @@ const startRender = async () => {
   renderProgress.value = 0;
   renderQueuedOnServer.value = false;
 
-  const tl     = cb.timelineInstance.value;
-  const vb     = cb.plugins.vb;
-  const base   = renderServerUrl.value.replace(/\/$/, '');
-  const fmt    = renderConfig.format || 'mp4';
-  const scale  = renderConfig.scaleMultiplier || 1;
-  const isWebm = fmt === 'webm';
+  const vb   = cb.plugins.vb;
+  const base = renderServerUrl.value.replace(/\/$/, '');
+  const fmt  = renderConfig.format || 'mp4';
+  const scale = renderConfig.scaleMultiplier || 1;
 
   try {
-    // ── 1. Pause + seek to startTime ────────────────────────────────────────
-    tl.pause();
-    tl.seek(renderConfig.startTime || 0);
-    await new Promise(r => setTimeout(r, 80));
-
-    // ── 2. Clone the live frame container ───────────────────────────────────
-    renderStatus.value = 'Serializing frame…';
+    // ── 1. Serialize project (reuse existing export pipeline) ────────────────
+    renderStatus.value = 'Serializing project…';
     renderProgress.value = 5;
-    const container = userSvgContainer.value;
-    if (!container) throw new Error('Frame container not found. Make sure a composition is loaded.');
-    const clone = container.cloneNode(true);
 
-    // Fix dimensions to exact px — remove responsive sizing
-    clone.style.cssText = [
-      `width:${vb.w}px`, `height:${vb.h}px`,
-      'position:relative', 'overflow:hidden',
-      'max-width:unset', 'max-height:unset', 'aspect-ratio:unset',
-    ].join(';');
+    // _buildProjectZip already handles: nodes, tweens, fonts (base64),
+    // effects, templates, swapTemplates, initialStates, globalDataSources.
+    // We read project.json straight out of the zip rather than re-implementing.
+    const zip         = await _buildProjectZip();
+    const projectFile = zip.file('project.json');
+    if (!projectFile) throw new Error('Failed to build project.json for render.');
+    const projectJson = JSON.parse(await projectFile.async('string'));
 
-    // For WebM: hide bg rects so frames are transparent
-    if (isWebm) {
-      clone.querySelectorAll('[id="bg"],[id^="bg-"]').forEach(el => {
-        if (el.tagName.toLowerCase() === 'rect') el.setAttribute('fill', 'none');
-      });
-    }
-
-    // ── 3. Inline video blob URLs → base64 ──────────────────────────────────
-    renderStatus.value = 'Inlining video assets…';
-    renderProgress.value = 10;
-    const videoEls = Array.from(clone.querySelectorAll('video'));
-    for (const v of videoEls) {
-      const liveEl = v.id ? document.getElementById(v.id) : null;
-      const src    = (liveEl && liveEl.src) || v.src || v.getAttribute('src') || '';
-      if (src.startsWith('blob:')) {
-        try {
-          const res  = await fetch(src);
-          const buf  = await res.arrayBuffer();
-          const b64  = btoa(String.fromCharCode(...new Uint8Array(buf)));
-          const mime = res.headers.get('content-type') || 'video/mp4';
-          v.setAttribute('src', `data:${mime};base64,${b64}`);
-        } catch(e) { /* skip */ }
-      } else if (src) {
-        v.setAttribute('src', src);
-      }
-      v.setAttribute('muted', '');
-      v.setAttribute('playsinline', '');
-      v.setAttribute('preload', 'auto');
-    }
-
-    // ── 4. Collect @font-face CSS ────────────────────────────────────────────
-    renderStatus.value = 'Collecting fonts…';
-    renderProgress.value = 15;
-    let fontCss = '';
-    try {
-      for (const sheet of document.styleSheets) {
-        try {
-          for (const rule of sheet.cssRules) {
-            if (rule.type === CSSRule.FONT_FACE_RULE) fontCss += rule.cssText + '\n';
-          }
-        } catch(e) {}
-      }
-    } catch(e) {}
-
-    // ── 5. Serialize tweens for server __qween_seek ──────────────────────────
-    renderStatus.value = 'Building payload…';
-    renderProgress.value = 20;
-    const tweens     = cb.getTweens ? (cb.getTweens() || []) : [];
-    const tweensJson = JSON.stringify(tweens);
-    const frameHtml  = clone.outerHTML;
-    const bgStyle    = isWebm ? 'transparent' : '#000';
-    const w          = Math.round(vb.w * scale);
-    const h          = Math.round(vb.h * scale);
-
-    // ── 5b. Build animation-engine bootstrap so the server's __qween_seek
-    //        has a real GSAP timeline (window.__masterTl) to scrub.
-    const engineBundle = document.getElementById('qween-engine-bundle')?.textContent || '';
-    const rootSvgId          = cb.rootSvgId.value;
-    const originalViewBoxRaw = toRaw(cb.originalViewBox);
-    const timelineLoop       = cb.getTimelineLoop();
-    const timelineYoyo       = cb.getTimelineYoyo();
-    const timelineReverse    = cb.getTimelineReverse();
-    const globalDataSources  = toRaw(cb.getGlobalDataSources());
-    const swapTemplates      = toRaw(cb.getSwapTemplates());
-    const storedInitialStates= toRaw(cb.getStoredInitialStates());
-
-    const engineBootstrap = `
-${engineBundle}
-gsap.registerPlugin(DrawSVGPlugin, MotionPathPlugin, MorphSVGPlugin, TextPlugin, ScrambleTextPlugin, Physics2DPlugin, EasePack);
-window.__masterTl = AnimationEngine.buildTimeline(
-  ${JSON.stringify(tweens)},
-  ${JSON.stringify(!!timelineLoop)},
-  ${JSON.stringify(!!timelineYoyo)},
-  ${JSON.stringify(rootSvgId)},
-  {},
-  ${JSON.stringify(originalViewBoxRaw)},
-  ${JSON.stringify(!!timelineReverse)},
-  ${JSON.stringify(globalDataSources || [])},
-  ${JSON.stringify(swapTemplates || [])},
-  { value: ${JSON.stringify(storedInitialStates || [])} }
-);
-window.__masterTl.pause(0);
-`;
-
-    // ── 6. Build self-contained stage HTML ───────────────────────────────────
-    const stageHtml = `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-*{margin:0;padding:0;box-sizing:border-box;}
-body{background:${bgStyle};overflow:hidden;width:${vb.w}px;height:${vb.h}px;}
-${fontCss}
-</style>
-</head>
-<body id="qween-body">
-${frameHtml}
-<script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/gsap.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/DrawSVGPlugin.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/MotionPathPlugin.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/MorphSVGPlugin.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/TextPlugin.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/ScrambleTextPlugin.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/Physics2DPlugin.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/EasePack.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/dexie@4/dist/dexie.min.js"></script>
-<script>
-${engineBootstrap}
-</script>
-</body>
-</html>`;
-
-    // ── 7. Send to server ────────────────────────────────────────────────────
+    // ── 2. Send to server ────────────────────────────────────────────────────
     renderStatus.value = 'Sending to server…';
-    renderProgress.value = 25;
+    renderProgress.value = 20;
 
     const payload = {
-      stageHtml,
-      tweensJson,
+      projectJson,
       fps:             renderConfig.fps,
       crf:             renderConfig.crf,
       format:          fmt,
