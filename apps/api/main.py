@@ -762,13 +762,26 @@ def _run_playwright_render(job_id: str, req: PlaywrightRenderRequest, job_dir: P
         html_path.write_text(app_html, encoding="utf-8")
         _job_update(job_id, status="processing", message="Launching browser…", progress=2)
 
-        # ── 4. Launch Playwright ──────────────────────────────────────────────
+        # ── 4. Spin up a local HTTP server so CDN scripts load correctly ──────
+        # file:// URLs block external CDN requests in Chromium; http:// does not.
+        import http.server, socketserver, random
+        http_port = random.randint(19000, 29000)
+        html_dir  = str(job_dir)
+
+        class _SilentHandler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, directory=html_dir, **kw)
+            def log_message(self, *a): pass
+
+        httpd = socketserver.TCPServer(("127.0.0.1", http_port), _SilentHandler)
+        srv_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        srv_thread.start()
+
+        # ── 5. Launch Playwright ──────────────────────────────────────────────
         with sync_playwright() as p:
             browser = p.chromium.launch(args=[
                 "--no-sandbox", "--disable-setuid-sandbox",
                 "--autoplay-policy=no-user-gesture-required",
-                "--disable-web-security", "--allow-file-access-from-files",
-                "--disable-features=IsolateOrigins,site-per-process",
                 "--disable-background-timer-throttling",
                 "--disable-backgrounding-occluded-windows",
                 "--disable-renderer-backgrounding",
@@ -782,8 +795,8 @@ def _run_playwright_render(job_id: str, req: PlaywrightRenderRequest, job_dir: P
                     "document.body && (document.body.style.background='transparent');"
                 )
 
-            # Load with ?mode=render so QweenApp boots headlessly
-            page.goto(f"file://{html_path.resolve()}?mode=render")
+            # Load over HTTP so CDN scripts (GSAP, Vue, ElementPlus) load correctly
+            page.goto(f"http://127.0.0.1:{http_port}/stage.html?mode=render")
 
             # Wait for QweenApp to finish building the timeline
             page.wait_for_function("window.__qween_ready === true", timeout=45_000)
@@ -820,6 +833,8 @@ def _run_playwright_render(job_id: str, req: PlaywrightRenderRequest, job_dir: P
                     progress=pct)
 
             browser.close()
+
+        httpd.shutdown()
 
         # ── 4. Stitch with ffmpeg ────────────────────────────────────────────
         output        = output_path_for(job_dir, fmt)
