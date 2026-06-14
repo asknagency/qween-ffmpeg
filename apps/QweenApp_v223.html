@@ -4,21 +4,19 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>QweenApp</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-<script src="https://cdn.tailwindcss.com"></script>
+<link href="./vendor/inter-font.css" rel="stylesheet">
+<script src="./vendor/tailwind.min.js"></script>
 <script>
 tailwind.config = { darkMode: 'class', theme: { extend: { colors: { dark: { 900: '#121212', 800: '#1e1e1e', 700: '#2d2d2d', 600: '#3d3d3d' }, brand: '#409EFF' } } } }
 </script>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/element-plus/dist/index.css" />
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/element-plus/theme-chalk/dark/css-vars.css">
-<script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/element-plus"></script>
-<script src="https://unpkg.com/@element-plus/icons-vue"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/opentype.js@latest/dist/opentype.min.js"></script>
+<link rel="stylesheet" href="./vendor/element-plus-index.css" />
+<link rel="stylesheet" href="./vendor/element-plus-dark-vars.css">
+<script src="./vendor/vue.global.js"></script>
+<script src="./vendor/element-plus.min.js"></script>
+<script src="./vendor/element-plus-icons-vue.min.js"></script>
+<script src="./vendor/jszip.min.js"></script>
+<script src="./vendor/FileSaver.min.js"></script>
+<script src="./vendor/opentype.min.js"></script>
 <style>
 ::-webkit-scrollbar { width: 6px; height: 6px; } ::-webkit-scrollbar-track { background: #1e1e1e; } ::-webkit-scrollbar-thumb { background: #444; border-radius: 3px; } ::-webkit-scrollbar-thumb:hover { background: #555; }
 .custom-scrollbar::-webkit-scrollbar { width: 4px; height: 4px; } .custom-scrollbar::-webkit-scrollbar-track { background: transparent; } .custom-scrollbar::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; } .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #555; } .custom-scrollbar { scrollbar-width: thin; scrollbar-color: #333 transparent; }
@@ -4656,15 +4654,15 @@ class="p-2 border rounded cursor-pointer transition-colors text-xs flex justify-
 </transition>
 </teleport>
 </script>
-<script src="https://cdn.jsdelivr.net/npm/dexie@4/dist/dexie.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/gsap.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/DrawSVGPlugin.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/MotionPathPlugin.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/MorphSVGPlugin.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/TextPlugin.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/ScrambleTextPlugin.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/Physics2DPlugin.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/EasePack.min.js"></script>
+<script src="./vendor/dexie.min.js"></script>
+<script src="./vendor/gsap.min.js"></script>
+<script src="./vendor/DrawSVGPlugin.min.js"></script>
+<script src="./vendor/MotionPathPlugin.min.js"></script>
+<script src="./vendor/MorphSVGPlugin.min.js"></script>
+<script src="./vendor/TextPlugin.min.js"></script>
+<script src="./vendor/ScrambleTextPlugin.min.js"></script>
+<script src="./vendor/Physics2DPlugin.min.js"></script>
+<script src="./vendor/EasePack.min.js"></script>
 <script type="text/plain" id="qween-engine-bundle">
 let _qidCounter = 0;
 const _qid = (prefix) => `${prefix}_${++_qidCounter}`;
@@ -12719,9 +12717,9 @@ app.use(ElementPlus); app.mount('#app');
   // Retrieve the app's internal state via the provide/inject bridge
   // The root app instance exposes _instance.appContext.provides
   const appInstance = app._instance;
-  const appState = appInstance && appInstance.appContext.provides &&
-                   (appInstance.appContext.provides['appState'] ||
-                    Object.values(appInstance.appContext.provides).find(v => v && v.nodes));
+  const appState = appInstance && appInstance.provides &&
+                   (appInstance.provides['appState'] ||
+                    Object.values(appInstance.provides).find(v => v && v.nodes));
   if (!appState) {
     console.error('[QweenRender] Could not locate appState.');
     return;
@@ -12745,21 +12743,24 @@ app.use(ElementPlus); app.mount('#app');
           await fontDB.put(fontObj);
         } catch(e) { console.warn('[QweenRender] Font load failed:', f.family, e); }
       }
-      cb.setLocalFonts(await fontDB.getAll());
+      cb.localFonts.value = await fontDB.getAll();
     }
 
     // 2. Set all project state
-    if (cb.getMasterCtx()) cb.getMasterCtx().revert();
-    cb.setMasterCtx(null);
-    cb.setTweens(projectData.tweens || []);
-    cb.setEffects(projectData.effects || []);
-    cb.setTemplates(projectData.templates || []);
-    cb.setSwapTemplates(projectData.swapTemplates || []);
-    cb.setStoredInitialStates(projectData.initialStates || []);
-    cb.setGlobalDataSources(projectData.globalDataSources || []);
-    cb.setTimelineLoop(!!projectData.timelineLoop);
-    cb.setTimelineYoyo(!!projectData.timelineYoyo);
-    cb.setTimelineReverse(!!projectData.timelineReverse);
+    if (cb.masterCtx.value) cb.masterCtx.value.revert();
+    cb.masterCtx.value = null;
+    cb.tweens.value = projectData.tweens || [];
+    cb.effects.value = projectData.effects || [];
+    cb.templates.value = projectData.templates || [];
+    cb.swapTemplates.value = projectData.swapTemplates || [];
+    cb.storedInitialStates.value = projectData.initialStates || [];
+    cb.globalDataSources.value = projectData.globalDataSources || [];
+    if (Array.isArray(cb.globalDataSources.value)) {
+      cb.globalDataSources.value.forEach(s => { if (s.startIndex === undefined) s.startIndex = 0; });
+    }
+    cb.timelineLoop.value = !!projectData.timelineLoop;
+    cb.timelineYoyo.value = !!projectData.timelineYoyo;
+    cb.timelineReverse.value = !!projectData.timelineReverse;
 
     // 3. Restore nodes
     if (projectData.nodes && projectData.nodes.length > 0) {
@@ -12801,13 +12802,11 @@ app.use(ElementPlus); app.mount('#app');
               if (svgEl && svgEl.tagName.toLowerCase() === 'svg') {
                 svgRootId = svgEl.id || svgRootId;
                 svgInnerChildren = buildTreeFromDOM(svgEl);
-                cb.rootSvgId.value = svgEl.id || 'main-svg-root';
                 const vb = svgEl.getAttribute('viewBox');
-                if (vb) {
+                if (vb && cb.plugins) {
                   const parts = vb.split(/\s+|,/);
                   const vbObj = { x: parseFloat(parts[0]), y: parseFloat(parts[1]), w: parseFloat(parts[2]), h: parseFloat(parts[3]) };
                   Object.assign(cb.plugins, { vb: { ...cb.plugins.vb, ...vbObj } });
-                  Object.assign(cb.originalViewBox, vbObj);
                 }
               }
             } catch(e) {}
