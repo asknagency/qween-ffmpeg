@@ -1,3 +1,6 @@
+import hashlib
+import json
+import math
 import re
 import shutil
 import subprocess
@@ -12,7 +15,7 @@ from typing import Any, Dict, List, Optional
 import aiofiles
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 # ── App setup ─────────────────────────────────────────────────────────────────
@@ -34,6 +37,27 @@ FORMAT_CONFIG = {
 }
 VALID_FORMATS       = set(FORMAT_CONFIG.keys())
 VALID_VIDEO_FORMATS = {"mp4", "mov", "webm"}
+
+# ── Asset store config ────────────────────────────────────────────────────────
+ASSETS_DIR = WORK_DIR / "assets"
+ASSETS_DIR.mkdir(exist_ok=True)
+ASSET_VIDEO_EXTS = {".mp4", ".mov", ".webm", ".avi", ".mkv"}
+ASSET_FONT_EXTS  = {".woff2", ".woff", ".ttf", ".otf"}
+ASSET_ALLOWED_EXTS = ASSET_VIDEO_EXTS | ASSET_FONT_EXTS
+ASSET_MIME = {
+    ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
+    ".avi": "video/x-msvideo", ".mkv": "video/x-matroska",
+    ".woff2": "font/woff2", ".woff": "font/woff",
+    ".ttf": "font/ttf", ".otf": "font/otf",
+}
+_asset_hash_index: Dict[str, str] = {}  # content_hash -> asset_id
+_asset_lock = threading.Lock()
+
+# ── Playwright render ────────────────────────────────────────────────────────
+from render_stage.build import build_stage_html  # noqa: E402
+
+_render_payloads: Dict[str, dict] = {}
+_render_lock = threading.Lock()
 
 # ── Job metadata ──────────────────────────────────────────────────────────────
 _job_meta: Dict[str, Dict[str, Any]] = {}
@@ -76,10 +100,26 @@ def _sweep_old_jobs(max_age_hours: float = AUTO_CLEAN_HOURS):
     cutoff = time.time() - max_age_hours * 3600
     removed = 0
     for d in WORK_DIR.iterdir():
-        if d.is_dir() and d.stat().st_mtime < cutoff:
+        if not d.is_dir() or d == ASSETS_DIR:
+            continue
+        if d.stat().st_mtime < cutoff:
             shutil.rmtree(d, ignore_errors=True)
             with _meta_lock: _job_meta.pop(d.name, None)
             with _async_lock: _async_jobs.pop(d.name, None)
+            removed += 1
+    # Sweep individual assets on the same schedule
+    for d in ASSETS_DIR.iterdir():
+        if d.is_dir() and d.stat().st_mtime < cutoff:
+            content_hash = None
+            meta_path = d / "meta.json"
+            if meta_path.exists():
+                try:
+                    content_hash = json.loads(meta_path.read_text()).get("content_hash")
+                except Exception:
+                    pass
+            shutil.rmtree(d, ignore_errors=True)
+            if content_hash:
+                with _asset_lock: _asset_hash_index.pop(content_hash, None)
             removed += 1
     return removed
 
@@ -791,3 +831,225 @@ async def mux_audio(
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(400, f"Audio mux failed: {friendly_ffmpeg_error(err)}")
     return build_result(job_dir, job_id, output_format)
+
+
+# ── Asset store ────────────────────────────────────────────────────────────────
+# Lightweight content-addressed store for video/font assets referenced by
+# /jobs/playwright-render. Avoids round-tripping base64-encoded blobs through
+# the job JSON payload.
+@app.post("/assets/upload")
+async def upload_asset(file: UploadFile = File(...), content_hash: Optional[str] = Form(None)):
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in ASSET_ALLOWED_EXTS:
+        raise HTTPException(
+            400,
+            f"Unsupported asset type '{suffix}'. Allowed: {', '.join(sorted(ASSET_ALLOWED_EXTS))}",
+        )
+
+    data = await file.read()
+    size_mb = len(data) / 1_048_576
+    if suffix in ASSET_VIDEO_EXTS and size_mb > MAX_VIDEO_MB:
+        raise HTTPException(413, f"Asset too large ({size_mb:.0f} MB). Max is {MAX_VIDEO_MB} MB.")
+
+    computed_hash = hashlib.sha256(data).hexdigest()
+    dedupe_key = content_hash or computed_hash
+
+    # Deduplication: same content hash → return existing asset_id if still on disk
+    with _asset_lock:
+        existing_id = _asset_hash_index.get(dedupe_key)
+    if existing_id:
+        existing_dir = ASSETS_DIR / existing_id
+        existing_files = list(existing_dir.glob("file.*")) if existing_dir.exists() else []
+        if existing_files:
+            existing_dir.touch()  # bump mtime so it survives the next sweep
+            return {
+                "asset_id": existing_id,
+                "size_mb": round(existing_files[0].stat().st_size / 1_048_576, 2),
+                "content_hash": dedupe_key,
+                "expires_in": f"{AUTO_CLEAN_HOURS}h",
+            }
+
+    asset_id  = str(uuid.uuid4())
+    asset_dir = ASSETS_DIR / asset_id
+    asset_dir.mkdir(parents=True)
+    asset_path = asset_dir / f"file{suffix}"
+    async with aiofiles.open(asset_path, "wb") as f:
+        await f.write(data)
+    (asset_dir / "meta.json").write_text(json.dumps({
+        "filename": file.filename, "content_hash": dedupe_key,
+        "mime": ASSET_MIME.get(suffix, "application/octet-stream"),
+        "uploaded_at": time.time(),
+    }))
+
+    with _asset_lock:
+        _asset_hash_index[dedupe_key] = asset_id
+
+    return {
+        "asset_id": asset_id,
+        "size_mb": round(size_mb, 2),
+        "content_hash": dedupe_key,
+        "expires_in": f"{AUTO_CLEAN_HOURS}h",
+    }
+
+
+@app.get("/assets/{asset_id}")
+def get_asset(asset_id: str):
+    asset_dir = ASSETS_DIR / asset_id
+    if not asset_dir.exists():
+        raise HTTPException(404, "Asset not found or expired.")
+    files = list(asset_dir.glob("file.*"))
+    if not files:
+        raise HTTPException(404, "Asset not found or expired.")
+    p = files[0]
+    mime = ASSET_MIME.get(p.suffix.lower(), "application/octet-stream")
+    return FileResponse(p, media_type=mime)
+
+
+@app.delete("/assets/{asset_id}")
+def delete_asset(asset_id: str):
+    asset_dir = ASSETS_DIR / asset_id
+    if not asset_dir.exists():
+        raise HTTPException(404, "Asset not found.")
+    content_hash = None
+    meta_path = asset_dir / "meta.json"
+    if meta_path.exists():
+        try: content_hash = json.loads(meta_path.read_text()).get("content_hash")
+        except Exception: pass
+    shutil.rmtree(asset_dir, ignore_errors=True)
+    if content_hash:
+        with _asset_lock: _asset_hash_index.pop(content_hash, None)
+    return {"deleted": asset_id}
+
+
+# ── Playwright frame-by-frame render ──────────────────────────────────────────
+class PlaywrightRenderRequest(BaseModel):
+    fps: float = 30
+    crf: int = 18
+    format: str = "mp4"
+    startTime: float = 0
+    endTime: float = 0
+    stageWidth: int = 1920
+    stageHeight: int = 1080
+    nodes: List[Dict[str, Any]] = []
+    videoAssets: List[Dict[str, Any]] = []
+    fontAssets: List[Dict[str, Any]] = []
+    tweens: List[Dict[str, Any]] = []
+    timelineLoop: bool = False
+    timelineYoyo: bool = False
+    timelineReverse: bool = False
+    timelineSpeed: float = 1
+    rootSvgId: str = "main-svg-root"
+    originalViewBox: Optional[Dict[str, Any]] = None
+    globalDataSources: List[Dict[str, Any]] = []
+    swapTemplates: List[Dict[str, Any]] = []
+    storedInitialStates: List[Dict[str, Any]] = []
+    gsapCdn: Optional[str] = None
+
+
+@app.get("/render-stage/{job_id}")
+def render_stage(job_id: str):
+    with _render_lock:
+        payload = _render_payloads.get(job_id)
+    if payload is None:
+        raise HTTPException(404, "Render job not found or already completed.")
+    html = build_stage_html(payload, asset_base="/assets")
+    return HTMLResponse(html)
+
+
+def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
+                            fps: float, crf: int):
+    import asyncio
+    from playwright.async_api import async_playwright
+
+    _job_update(job_id, status="processing", message="Launching renderer…", progress=2)
+
+    frames_dir = job_dir / "frames"
+    frames_dir.mkdir(exist_ok=True)
+
+    start_time = payload.get("startTime", 0) or 0
+    end_time   = payload.get("endTime", 0) or 0
+    stage_w    = payload.get("stageWidth", 1920)
+    stage_h    = payload.get("stageHeight", 1080)
+    total_frames = max(1, math.ceil((end_time - start_time) * fps))
+
+    async def _render():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(args=["--autoplay-policy=no-user-gesture-required"])
+            page = await browser.new_page(viewport={"width": stage_w, "height": stage_h})
+            try:
+                await page.goto(f"http://localhost:8000/render-stage/{job_id}", wait_until="load")
+                await page.wait_for_function("window.__qween_ready === true", timeout=120_000)
+
+                for i in range(total_frames):
+                    t = start_time + (i / fps)
+                    await page.evaluate("(t) => window.__qween_seek(t)", t)
+                    await page.wait_for_function("window.__qween_frame_ready === true", timeout=30_000)
+                    await page.screenshot(
+                        path=str(frames_dir / f"frame_{i:06d}.png"),
+                        clip={"x": 0, "y": 0, "width": stage_w, "height": stage_h},
+                    )
+                    _job_update(job_id, progress=int((i + 1) / total_frames * 72),
+                                 message=f"Frame {i+1}/{total_frames}")
+            finally:
+                await browser.close()
+
+    asyncio.run(_render())
+
+    _job_update(job_id, status="processing", message="Stitching frames…", progress=74)
+
+    output = output_path_for(job_dir, fmt)
+    cfg = FORMAT_CONFIG[fmt]
+    input_pattern = str(frames_dir / "frame_%06d.png")
+    if fmt == "gif":
+        code, err = stitch_to_gif(input_pattern, fps, job_dir, output)
+    else:
+        args = ["-framerate", str(fps), "-i", input_pattern, *cfg["codec_args"]]
+        if fmt in ("mp4", "mov"): args += ["-crf", str(crf), "-preset", "medium"]
+        elif fmt == "webm":       args += ["-crf", str(crf), "-b:v", "0"]
+        args += [str(output)]
+        code, _, err = run_ffmpeg_queued(args)
+
+    if code != 0:
+        raise RuntimeError(friendly_ffmpeg_error(err))
+
+    mb = round(output.stat().st_size / 1_048_576, 2)
+    _mark_output(job_id, fmt, mb)
+    _job_update(job_id, status="done", message=f"Done — {mb} MB", progress=100, size_mb=mb, format=fmt)
+
+
+def _run_playwright_render_safe(job_id: str, job_dir: Path, payload: dict, fmt: str,
+                                 fps: float, crf: int):
+    try:
+        _run_playwright_render(job_id, job_dir, payload, fmt, fps, crf)
+    except Exception as e:
+        _job_update(job_id, status="error", message=str(e), progress=0)
+    finally:
+        with _render_lock:
+            _render_payloads.pop(job_id, None)
+
+
+@app.post("/jobs/playwright-render")
+async def playwright_render(req: PlaywrightRenderRequest, background_tasks: BackgroundTasks):
+    fmt = req.format
+    if fmt not in VALID_FORMATS:
+        raise HTTPException(400, f"Invalid format. Choose from: {', '.join(sorted(VALID_FORMATS))}")
+    if fmt == "gif":
+        raise HTTPException(400, "GIF is not supported for Video Render.")
+    if req.endTime <= req.startTime:
+        raise HTTPException(400, "endTime must be greater than startTime.")
+
+    job_id, job_dir = new_job(label=f"playwright-render → {fmt.upper()}")
+    _job_init(job_id, label=f"playwright-render → {fmt.upper()}")
+
+    payload = req.model_dump()
+    with _render_lock:
+        _render_payloads[job_id] = payload
+
+    t = threading.Thread(
+        target=_run_playwright_render_safe,
+        args=(job_id, job_dir, payload, fmt, req.fps, req.crf),
+        daemon=True,
+    )
+    t.start()
+
+    return {"job_id": job_id, "status": "queued", "poll_url": f"/jobs/{job_id}/status"}
