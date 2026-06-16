@@ -1214,6 +1214,36 @@ async function run() {
       }));
     }
 
+    // ── 2b. Restore video blobs from assets/ in the ZIP ──────────────────────
+    // When QweenRender is driven by a project ZIP (either exported from QweenApp
+    // or written by the API's render-project path), video blobs are embedded under
+    // assets/<filename>.  Restore them as object URLs so <video src> works inside
+    // the headless Playwright browser without needing an external asset server.
+    for (const node of (project.nodes || [])) {
+      if (node.type !== 'video') continue;
+      const slots = (node._videoSlots && node._videoSlots.length)
+        ? node._videoSlots
+        : (node._videoContent ? [node._videoContent] : []);
+      for (const slot of slots) {
+        if (!slot || slot.src) continue;          // already has a src — skip
+        const assetFile = slot._assetFile || slot._label;
+        if (!assetFile) continue;
+        const entry = zip.file(`assets/${assetFile}`);
+        if (!entry) continue;
+        try {
+          const ab = await entry.async('arraybuffer');
+          slot.src = URL.createObjectURL(
+            new Blob([ab], { type: slot.mimeType || 'video/mp4' })
+          );
+        } catch (e) {
+          console.warn('[QweenRender] Failed to restore blob from ZIP assets/', assetFile, e);
+        }
+      }
+      // Keep _videoSlots and _videoContent in sync
+      if (!node._videoSlots) node._videoSlots = slots;
+      node._videoContent = slots[0] || node._videoContent;
+    }
+
     // ── 3. Build DOM ───────────────────────────────────────
     setStatus('Building scene…');
     const rootSvgId = buildDom(project);

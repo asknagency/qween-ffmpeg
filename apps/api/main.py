@@ -22,8 +22,8 @@ from pydantic import BaseModel
 app = FastAPI(title="QweenFFmpeg API", version="4.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-WORK_DIR         = Path(tempfile.gettempdir()) / "qween_ffmpeg"
-WORK_DIR.mkdir(exist_ok=True)
+WORK_DIR         = Path(os.environ.get("WORK_DIR", str(Path(tempfile.gettempdir()) / "qween_ffmpeg")))
+WORK_DIR.mkdir(parents=True, exist_ok=True)
 MAX_ZIP_MB       = 500
 MAX_VIDEO_MB     = 2048
 AUTO_CLEAN_HOURS = 6
@@ -39,8 +39,11 @@ VALID_FORMATS       = set(FORMAT_CONFIG.keys())
 VALID_VIDEO_FORMATS = {"mp4", "mov", "webm"}
 
 # ── Asset store config ────────────────────────────────────────────────────────
-ASSETS_DIR = WORK_DIR / "assets"
-ASSETS_DIR.mkdir(exist_ok=True)
+# ASSETS_DIR can be overridden via env var so API and renderer containers can
+# share the same persistent volume path (e.g. /data/qween_assets).
+_assets_env = os.environ.get("ASSETS_DIR")
+ASSETS_DIR = Path(_assets_env) if _assets_env else WORK_DIR / "assets"
+ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 ASSET_VIDEO_EXTS = {".mp4", ".mov", ".webm", ".avi", ".mkv"}
 ASSET_FONT_EXTS  = {".woff2", ".woff", ".ttf", ".otf"}
 ASSET_ALLOWED_EXTS = ASSET_VIDEO_EXTS | ASSET_FONT_EXTS
@@ -952,10 +955,51 @@ class PlaywrightRenderRequest(BaseModel):
 # /render-stage removed — Playwright now loads QweenRender.html directly
 
 
+def _remap_payload_for_render(payload: dict) -> dict:
+    """
+    Convert the camelCase client/project shape into the underscore-prefixed shape
+    that QweenRender.html's buildDom() expects.  Must be called before the payload
+    is written to project.json inside the ZIP.
+
+    Mirrors the remapping block in /jobs/playwright-render so both render paths
+    (playwright-render and render-project) produce identical project.json structures.
+    """
+    for node in payload.get("nodes", []):
+        # svgContent → _svgContent
+        if "svgContent" in node:
+            node["_svgContent"] = node.pop("svgContent")
+
+        if node.get("type") == "video":
+            remapped = []
+            for slot in node.get("videoSlots") or []:
+                asset_id = slot.get("asset_id")
+                src = f"{RENDERER_URL}/assets/{asset_id}" if asset_id else ""
+                remapped.append({
+                    "_treeId":  slot.get("treeId", ""),
+                    "_label":   slot.get("label", ""),
+                    "src":      src,
+                    "mimeType": slot.get("mimeType", "video/mp4"),
+                })
+            node["_videoSlots"] = remapped
+            node.pop("videoSlots", None)
+
+    # storedInitialStates → initialStates
+    if "storedInitialStates" in payload and "initialStates" not in payload:
+        payload["initialStates"] = payload.pop("storedInitialStates")
+
+    return payload
+
+
 def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
                             fps: float, crf: int):
     import asyncio
     from playwright.async_api import async_playwright
+
+    # Ensure the payload has the underscore-prefixed shape QweenRender.html expects.
+    # render-project calls us directly (bypassing the HTTP endpoint remap), so we
+    # must remap here.  playwright-render already remaps before calling us, so the
+    # call is idempotent (videoSlots will already be absent and _videoSlots present).
+    _remap_payload_for_render(payload)
 
     _job_update(job_id, status="processing", message="Launching renderer…", progress=2)
 
@@ -1450,31 +1494,8 @@ async def playwright_render(req: PlaywrightRenderRequest, background_tasks: Back
 
     payload = req.model_dump()
 
-    # ── Remap payload fields to match what QweenRender.html buildDom() expects ──
-    # QweenApp sends camelCase keys; QweenRender reads underscore-prefixed names.
-    for node in payload.get("nodes", []):
-        # Bug 1 (server-side guard): svgContent -> _svgContent
-        if "svgContent" in node:
-            node["_svgContent"] = node.pop("svgContent")
-
-        # Bug 2: videoSlots[]{treeId, asset_id} -> _videoSlots[]{_treeId, src}
-        if node.get("type") == "video":
-            remapped = []
-            for slot in node.get("videoSlots") or []:
-                asset_id = slot.get("asset_id")
-                src = f"{RENDERER_URL}/assets/{asset_id}" if asset_id else ""
-                remapped.append({
-                    "_treeId":  slot.get("treeId", ""),
-                    "_label":   slot.get("label", ""),
-                    "src":      src,
-                    "mimeType": slot.get("mimeType", "video/mp4"),
-                })
-            node["_videoSlots"] = remapped
-            node.pop("videoSlots", None)
-
-    # Bug 3 (server-side guard): storedInitialStates -> initialStates
-    if "storedInitialStates" in payload and "initialStates" not in payload:
-        payload["initialStates"] = payload.pop("storedInitialStates")
+    # Remap camelCase client shape → underscore shape QweenRender.html expects
+    _remap_payload_for_render(payload)
 
     # Build a minimal project ZIP from the JSON payload so QweenRender.html
     # can load it the same way it loads a real exported project
