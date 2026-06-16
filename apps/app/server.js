@@ -10,6 +10,9 @@ const url  = require('url');
 
 const PORT       = process.env.RENDERER_PORT || 3000;
 const PUBLIC_DIR = path.join(__dirname, 'public');
+// ASSETS_DIR is where the API stores uploaded video/font blobs.
+// Must match the Python ASSETS_DIR (default: /tmp/qween_ffmpeg/assets).
+const ASSETS_DIR = process.env.ASSETS_DIR || path.join(require('os').tmpdir(), 'qween_ffmpeg', 'assets');
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -23,6 +26,12 @@ const MIME = {
   '.woff2':'font/woff2',
   '.woff': 'font/woff',
   '.ttf':  'font/ttf',
+  '.mp4':  'video/mp4',
+  '.webm': 'video/webm',
+  '.mov':  'video/quicktime',
+  '.avi':  'video/x-msvideo',
+  '.mkv':  'video/x-matroska',
+  '.otf':  'font/otf',
 };
 
 const PROJECTS_DIR = path.join(PUBLIC_DIR, 'projects');
@@ -72,6 +81,37 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ deleted: id }));
     return;
+  }
+
+  // ── GET /assets/:id — serve uploaded video/font blobs to Playwright ──────────
+  // Assets are stored by the API as: ASSETS_DIR/<asset_id>/file.<ext>
+  if (req.method === 'GET' && reqPath.startsWith('/assets/')) {
+    const assetId  = reqPath.split('/')[2];
+    if (assetId) {
+      const assetDir = path.join(ASSETS_DIR, assetId);
+      // Security: prevent path traversal
+      if (!assetDir.startsWith(ASSETS_DIR)) {
+        res.writeHead(403); res.end('Forbidden'); return;
+      }
+      if (fs.existsSync(assetDir)) {
+        const files = fs.readdirSync(assetDir).filter(f => f.startsWith('file.'));
+        if (files.length > 0) {
+          const assetPath = path.join(assetDir, files[0]);
+          const ext  = path.extname(assetPath).toLowerCase();
+          const mime = MIME[ext] || 'application/octet-stream';
+          const stat = fs.statSync(assetPath);
+          res.writeHead(200, {
+            'Content-Type':   mime,
+            'Content-Length': stat.size,
+            'Cache-Control':  'public, max-age=3600',
+            'Accept-Ranges':  'bytes',
+          });
+          fs.createReadStream(assetPath).pipe(res);
+          return;
+        }
+      }
+    }
+    res.writeHead(404); res.end('Asset not found'); return;
   }
 
   // ── Static files from public/ ──────────────────────────────────────────────
