@@ -48,11 +48,11 @@
       }
     },
     "dev:web": {
-      "name": "▶ Web (Next.js :3001)",
+      "name": "▶ Web (Next.js :5000)",
       "command": "cd apps/web && pnpm dev",
       "runAtStart": true,
       "preview": {
-        "port": 3001
+        "port": 5000
       }
     },
     "health": {

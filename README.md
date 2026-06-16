@@ -6,7 +6,7 @@ A 3-in-1 monorepo for creating, rendering, and processing GSAP animations into v
 apps/
 ├── api/   FastAPI  · port 8000  — ffmpeg jobs, asset store, render orchestration
 ├── app/   Node.js  · port 3000  — serves QweenRender.html + project ZIPs to Playwright
-└── web/   Next.js  · port 3001  — QweenFFmpeg tools UI
+└── web/   Next.js  · port 5000  — QweenFFmpeg tools UI
 ```
 
 ## How it works
@@ -61,7 +61,7 @@ pnpm dev
 |-----|-----|--------------|
 | `apps/app` | http://localhost:3000 | Serves QweenRender.html for Playwright |
 | `apps/api` | http://localhost:8000 | FastAPI render & ffmpeg API |
-| `apps/web` | http://localhost:3001 | QweenFFmpeg tools UI |
+| `apps/web` | http://localhost:5000 | QweenFFmpeg tools UI |
 
 ## Render a project via curl
 

@@ -10,7 +10,7 @@ const PORT = process.env.RENDERER_PORT || 3000;
 // ── Static: QweenRender.html + anything else in public/ ──────────────────────
 app.use(express.static(path.join(__dirname, 'public'), {
   setHeaders(res, filePath) {
-    // Allow Playwright (same machine) and QweenApp (localhost:3001) to fetch
+    // Allow Playwright (same machine) and QweenApp (localhost:5000) to fetch
     res.setHeader('Access-Control-Allow-Origin', '*');
     // ZIPs should not be cached between renders
     if (filePath.endsWith('.zip')) {
