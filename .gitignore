@@ -1,0 +1,36 @@
+# Node
+node_modules/
+.next/
+dist/
+build/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Playwright
+/apps/api/.playwright/
+
+# Generated / temp
+/apps/app/public/projects/*.zip
+*.mp4
+*.mov
+*.webm
+
+# OS
+.DS_Store
+Thumbbs.db
+
+# Env
+.env
+.env.local
+.env.production
+
+# pnpm
+.pnpm-store/

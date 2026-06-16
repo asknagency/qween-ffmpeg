@@ -1,0 +1,17 @@
+{
+  "name": "qween",
+  "private": true,
+  "packageManager": "pnpm@9.1.0",
+  "scripts": {
+    "dev": "concurrently \"pnpm run dev:api\" \"pnpm run dev:app\" \"pnpm run dev:web\"",
+    "dev:api": "cd apps/api && uvicorn main:app --reload --port 8000",
+    "dev:app": "cd apps/app && node server.js",
+    "dev:web": "cd apps/web && pnpm run dev",
+    "install:all": "pnpm install && cd apps/api && pip install -r requirements.txt && python -m playwright install chromium --with-deps",
+    "build": "cd apps/web && pnpm run build",
+    "typecheck": "cd apps/web && pnpm exec tsc --noEmit"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
