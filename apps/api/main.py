@@ -40,10 +40,12 @@ VALID_FORMATS       = set(FORMAT_CONFIG.keys())
 VALID_VIDEO_FORMATS = {"mp4", "mov", "webm"}
 
 # ── Asset store config ────────────────────────────────────────────────────────
-# ASSETS_DIR can be overridden via env var so API and renderer containers can
-# share the same persistent volume path (e.g. /data/qween_assets).
+# ASSETS_DIR lives next to main.py (apps/api/assets/) so it is committed to the
+# repo file-system and survives deploys on single-host PaaS (CodeSandbox, Render,
+# Railway).  Override with the ASSETS_DIR env var when using a shared volume or
+# object-storage mount.
 _assets_env = os.environ.get("ASSETS_DIR")
-ASSETS_DIR = Path(_assets_env) if _assets_env else WORK_DIR / "assets"
+ASSETS_DIR = Path(_assets_env) if _assets_env else Path(__file__).parent / "assets"
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 ASSET_VIDEO_EXTS = {".mp4", ".mov", ".webm", ".avi", ".mkv"}
 ASSET_FONT_EXTS  = {".woff2", ".woff", ".ttf", ".otf"}
@@ -1014,9 +1016,29 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
     total_frames = max(1, math.ceil((end_time - start_time) * fps))
 
     async def _render():
-        # Save project ZIP to apps/app/public/projects/ so QweenRender can fetch it
+        # Rebuild the project ZIP from the already-remapped payload so QweenRender
+        # receives _videoSlots[].src rather than the original unremapped project.json.
+        # Also re-embed any assets/ blobs that were in the original ZIP so the
+        # QweenRender blob-restore path works as a fallback.
+        import io as _io
+        zip_buf = _io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as _zf:
+            _zf.writestr("project.json", json.dumps({
+                k: v for k, v in payload.items() if k != "_project_zip"
+            }))
+            # Re-embed assets/ blobs from the original ZIP if present
+            _orig_zip_bytes = payload.get("_project_zip")
+            if _orig_zip_bytes:
+                try:
+                    import zipfile as _zfmod, io as _io2
+                    with _zfmod.ZipFile(_io2.BytesIO(_orig_zip_bytes)) as _orig_zf:
+                        for _entry in _orig_zf.namelist():
+                            if _entry.startswith("assets/") and not _entry.endswith("/"):
+                                _zf.writestr(_entry, _orig_zf.read(_entry))
+                except Exception:
+                    pass
         project_zip_path = PROJECTS_DIR / f"{job_id}.zip"
-        project_zip_path.write_bytes(payload["_project_zip"])
+        project_zip_path.write_bytes(zip_buf.getvalue())
 
         render_url = (
             f"{RENDERER_URL}/QweenRender.html"

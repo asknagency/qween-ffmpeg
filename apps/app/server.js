@@ -10,9 +10,10 @@ const url  = require('url');
 
 const PORT       = process.env.RENDERER_PORT || 3000;
 const PUBLIC_DIR = path.join(__dirname, 'public');
-// ASSETS_DIR is where the API stores uploaded video/font blobs.
-// Must match the Python ASSETS_DIR (default: /tmp/qween_ffmpeg/assets).
-const ASSETS_DIR = process.env.ASSETS_DIR || path.join(require('os').tmpdir(), 'qween_ffmpeg', 'assets');
+// ASSETS_DIR must point to the same folder the API writes to.
+// Default: apps/api/assets/ (sibling of apps/app/ — persistent on-disk store).
+// Override with ASSETS_DIR env var when using a shared volume or object storage.
+const ASSETS_DIR = process.env.ASSETS_DIR || path.resolve(__dirname, '../../api/assets');
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
