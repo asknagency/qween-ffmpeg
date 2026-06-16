@@ -1199,10 +1199,19 @@ def _project_to_playwright_payload(project: dict, asset_map: dict,
 
                 # If _assetId not present, try to find a blob in the ZIP
                 if not asset_id:
-                    # asset_map keys are filenames from the ZIP assets/ folder
-                    # matched by _label or _treeId
-                    label = slot.get("_label", "") or tree_id
-                    asset_id = asset_map.get(label) or asset_map.get(tree_id)
+                    # Priority order:
+                    # 1. _assetFile  — exact filename written by _buildProjectZip (most reliable)
+                    # 2. _label      — original upload filename (e.g. "1000058550.mp4")
+                    # 3. _treeId     — fallback slot identifier
+                    asset_file = slot.get("_assetFile", "") or ""
+                    label      = slot.get("_label", "") or tree_id
+                    asset_id = (
+                        asset_map.get(asset_file)
+                        or asset_map.get(Path(asset_file).stem if asset_file else "")
+                        or asset_map.get(label)
+                        or asset_map.get(Path(label).stem if label else "")
+                        or asset_map.get(tree_id)
+                    )
 
                 if asset_id:
                     slot_payload.append({
