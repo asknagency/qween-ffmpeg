@@ -1,6 +1,7 @@
 'use client'
 import { useState, useEffect, useCallback } from 'react'
 import StitchTool  from '@/tools/StitchTool'
+import RenderTool  from '@/tools/RenderTool'
 import CropTool    from '@/tools/CropTool'
 import TrimTool    from '@/tools/TrimTool'
 import ScaleTool   from '@/tools/ScaleTool'
@@ -14,6 +15,7 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
 
 const TABS = [
   { id: 'stitch',  label: 'Stitch',  desc: 'Frames → Video' },
+  { id: 'render',  label: 'Render',  desc: 'Project → Video' },
   { id: 'crop',    label: 'Crop',    desc: 'Crop region'     },
   { id: 'trim',    label: 'Trim',    desc: 'Cut start/end'   },
   { id: 'scale',   label: 'Scale',   desc: 'Resize output'   },
@@ -122,6 +124,7 @@ export default function Home() {
       <div style={{ flex: 1, overflowY: 'auto', padding: '16px 16px 24px',
         paddingBottom: 'calc(24px + env(safe-area-inset-bottom))' }}>
         {active === 'stitch'  && <StitchTool  apiBase={API_BASE} />}
+        {active === 'render'  && <RenderTool  apiBase={API_BASE} />}
         {active === 'crop'    && <CropTool    apiBase={API_BASE} />}
         {active === 'trim'    && <TrimTool    apiBase={API_BASE} />}
         {active === 'scale'   && <ScaleTool   apiBase={API_BASE} />}

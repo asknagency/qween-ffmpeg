@@ -155,6 +155,28 @@ export async function segment(jobId: string, duration: number, base = DEFAULT_BA
   return apiFetch(`${base}/jobs/${jobId}/segment`, { method: 'POST', body: fd }, 'Segment failed')
 }
 
+// ── Render project (QweenApp ZIP → video, drives Playwright + ffmpeg) ─────────
+export interface RenderProjectParams {
+  fps: number; crf: number; format: VideoFormat
+  start_time?: number; end_time?: number
+  stage_width?: number; stage_height?: number
+}
+export interface RenderProjectResult {
+  job_id: string; status: string; poll_url: string
+  end_time: number; stage: string; format: string; fps: number
+}
+export async function renderProject(
+  file: File, params: RenderProjectParams, base = DEFAULT_BASE,
+  onProgress?: (pct: number) => void,
+): Promise<RenderProjectResult> {
+  const err = validateFile(file, 'zip')
+  if (err) throw new Error(err)
+  const fd = new FormData(); fd.append('file', file)
+  Object.entries(params).forEach(([k, v]) => { if (v !== undefined && v !== null && v !== '') fd.append(k, String(v)) })
+  if (onProgress) return uploadWithProgress(`${base}/jobs/render-project`, fd, onProgress)
+  return apiFetch(`${base}/jobs/render-project`, { method: 'POST', body: fd }, 'Render failed')
+}
+
 // ── Storage ───────────────────────────────────────────────────────────────────
 export async function getStorage(base = DEFAULT_BASE): Promise<StorageInfo> {
   return apiFetch(`${base}/storage`, { method: 'GET' }, 'Could not fetch storage info')
