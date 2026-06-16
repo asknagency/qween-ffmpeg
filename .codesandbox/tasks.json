@@ -2,8 +2,8 @@
   "$schema": "https://schemas.codesandbox.io/configuration/tasks.json",
   "setupTasks": [
     {
-      "name": "Install ffmpeg + ffprobe",
-      "command": "sudo apt-get update -qq && sudo apt-get install -y ffmpeg && ffmpeg -version"
+      "name": "Install ffmpeg",
+      "command": "sudo apt-get update -qq && sudo apt-get install -y ffmpeg"
     },
     {
       "name": "Install pnpm",
@@ -14,36 +14,43 @@
       "command": "pnpm install"
     },
     {
+      "name": "Install app deps",
+      "command": "cd apps/app && npm install"
+    },
+    {
       "name": "Install Python deps",
       "command": "cd apps/api && pip install -r requirements.txt"
     },
     {
       "name": "Install Playwright browser",
       "command": "cd apps/api && python -m playwright install chromium --with-deps"
+    },
+    {
+      "name": "Create .env",
+      "command": "[ -f .env ] || cp .env.example .env"
     }
   ],
   "tasks": {
-    "setup:env": {
-      "name": "⚙ Create .env from .env.example",
-      "command": "[ -f .env ] || cp .env.example .env; echo 'Env ready'"
-    },
     "dev:app": {
-      "name": "▶ Run Renderer (Node :3000)",
+      "name": "▶ Renderer (Node :3000)",
       "command": "cd apps/app && node server.js",
+      "runAtStart": true,
       "preview": {
         "port": 3000
       }
     },
     "dev:api": {
-      "name": "▶ Run API (FastAPI :8000)",
+      "name": "▶ API (FastAPI :8000)",
       "command": "cd apps/api && uvicorn main:app --reload --port 8000 --host 0.0.0.0",
+      "runAtStart": true,
       "preview": {
         "port": 8000
       }
     },
     "dev:web": {
-      "name": "▶ Run Web (Next.js :3001)",
+      "name": "▶ Web (Next.js :3001)",
       "command": "cd apps/web && pnpm dev",
+      "runAtStart": true,
       "preview": {
         "port": 3001
       }
