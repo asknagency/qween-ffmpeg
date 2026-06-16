@@ -5803,11 +5803,28 @@ if (projectData.nodes && projectData.nodes.length > 0) {
       const savedSlots = saved._videoSlots && saved._videoSlots.length ? saved._videoSlots : [node._videoContent];
       node._videoSlots = savedSlots.map((s, si) => ({ src: s.src || '', mimeType: s.mimeType || '', poster: s.poster || '', _treeId: s._treeId || (saved.id.replace(/^node-/, 'n') + '_video-' + (si + 1)), _dbId: s._dbId || null, _assetId: s._assetId || null, _label: s._label || '', _githubPath: s._githubPath || null, _duration: (s._duration && isFinite(s._duration)) ? parseFloat(s._duration.toFixed(3)) : null }));
       for (const slot of node._videoSlots) {
-        if (slot._dbId && (!slot.src || slot.src.startsWith('blob:'))) {
+        // 1) Try to restore from the embedded ZIP asset (self-contained export)
+        if (slot._assetFile && zip) {
+          try {
+            const entry = zip.file(`assets/${slot._assetFile}`);
+            if (entry) {
+              const ab = await entry.async('arraybuffer');
+              const mimeType = slot.mimeType || 'video/mp4';
+              const blob = new Blob([ab], { type: mimeType });
+              const blobObj = Vue.markRaw(blob);
+              // Store/update in IndexedDB so startVideoRender can upload it
+              const dbRecord = { id: slot._dbId || ('vid_zip_' + slot._treeId), url: '', blob: blobObj, mimeType, label: slot._label || slot._assetFile, source: 'zip', addedAt: Date.now(), updatedAt: Date.now(), githubPath: null };
+              if (slot._dbId) { try { await _imageDB.images.put({ ...dbRecord, id: slot._dbId }); } catch(e) {} }
+              slot.src = URL.createObjectURL(blobObj);
+            }
+          } catch(e) { console.warn('[_applyProjectData] ZIP asset restore failed:', slot._assetFile, e); }
+        }
+        // 2) Fallback: try IndexedDB (same browser session)
+        if ((!slot.src || slot.src.startsWith('blob:null')) && slot._dbId) {
           try {
             const record = await _imageDB.images.get(slot._dbId);
             if (record && record.blob) slot.src = URL.createObjectURL(Vue.markRaw(record.blob));
-          } catch(e) {   }
+          } catch(e) {}
         }
         // Probe _duration if it wasn't saved or is missing (e.g. older project files)
         if (!slot._duration && slot.src) {
@@ -5921,15 +5938,23 @@ const dataSourcesMeta = (cb.getGlobalDataSources() || []).map(src => {
   return meta;
 });
 
+// Collect video blobs to embed in the ZIP (assets/ folder)
+const videoAssetWrites = [];
 const serializedNodes = (cb.nodes && cb.nodes.value ? cb.nodes.value : []).map(n => {
   const base = { id: n.id, type: n.type || 'svg', width: n.width, height: n.height, zIndex: n.zIndex, visible: n.visible };
   if (n.type === 'video') {
-    const vc = n._videoContent || {};
-    base._videoContent = { src: vc.src || '', mimeType: vc.mimeType || '', poster: vc.poster || '', _treeId: vc._treeId || '', _dbId: vc._dbId || null, _assetId: vc._assetId || null, _label: vc._label || '', _githubPath: vc._githubPath || null, _duration: vc._duration || null };
-    
-    if (n._videoSlots && n._videoSlots.length > 0) {
-      base._videoSlots = n._videoSlots.map(s => ({ src: s.src || '', mimeType: s.mimeType || '', poster: s.poster || '', _treeId: s._treeId || '', _dbId: s._dbId || null, _assetId: s._assetId || null, _label: s._label || '', _githubPath: s._githubPath || null, _duration: s._duration || null }));
-    }
+    const allSlots = (n._videoSlots && n._videoSlots.length ? n._videoSlots : [n._videoContent]).filter(Boolean);
+    const serSlots = allSlots.map(s => {
+      const ext = (s.mimeType || 'video/mp4').split('/')[1] || 'mp4';
+      const assetFile = s._treeId ? `${s._treeId}.${ext}` : null;
+      // Schedule blob write into the ZIP
+      if (assetFile && s._dbId) {
+        videoAssetWrites.push({ dbId: s._dbId, assetFile });
+      }
+      return { src: '', mimeType: s.mimeType || '', poster: s.poster || '', _treeId: s._treeId || '', _dbId: s._dbId || null, _assetId: s._assetId || null, _assetFile: assetFile || null, _label: s._label || '', _githubPath: s._githubPath || null, _duration: s._duration || null };
+    });
+    base._videoContent = serSlots[0] || {};
+    base._videoSlots = serSlots;
   } else if (n.type === 'text') {
     base._textContent = JSON.parse(JSON.stringify(n._textContent || {}));
   } else {
@@ -5938,6 +5963,14 @@ const serializedNodes = (cb.nodes && cb.nodes.value ? cb.nodes.value : []).map(n
   return base;
 });
 zip.file('project.json', JSON.stringify({ version: PROJECT_VERSION, timelineLoop: cb.getTimelineLoop(), timelineYoyo: cb.getTimelineYoyo(), timelineReverse: cb.getTimelineReverse(), tweens: cb.getTweens(), effects: cb.getEffects(), templates: cb.getTemplates(), swapTemplates: cb.getSwapTemplates(), initialStates: cb.getStoredInitialStates(), globalDataSources: dataSourcesMeta, fonts: exportedFonts, nodes: serializedNodes }, null, 2));
+// Embed video blobs as binary files in assets/ so the project is self-contained
+const assetsFolder = zip.folder('assets');
+for (const { dbId, assetFile } of videoAssetWrites) {
+  try {
+    const record = await _imageDB.images.get(dbId);
+    if (record && record.blob) assetsFolder.file(assetFile, record.blob);
+  } catch(e) { console.warn('[_buildProjectZip] video blob not found in DB:', dbId, e); }
+}
 return zip;
 };
 const triggerZipImport = () => document.getElementById('zipInput').click();
@@ -6219,12 +6252,19 @@ const _assetContentHash = async (blob) => {
   }
 };
 
-const uploadAsset = async (blob, contentHash) => {
+const uploadAsset = async (blob, contentHash, label) => {
   if (!renderServerUrl.value) throw new Error('Set a render server URL first.');
   const base = renderServerUrl.value.replace(/\/$/, '');
   const hash = contentHash || await _assetContentHash(blob);
+  // Ensure the filename sent to the server has the correct extension so the
+  // server's ASSET_ALLOWED_EXTS check passes (blobs from IndexedDB have no .name).
+  let filename = blob.name || label || 'asset';
+  if (!filename.includes('.')) {
+    const mimeExt = { 'video/mp4': '.mp4', 'video/webm': '.webm', 'video/quicktime': '.mov', 'video/ogg': '.ogg', 'font/woff2': '.woff2', 'font/woff': '.woff', 'font/ttf': '.ttf', 'font/otf': '.otf' };
+    filename += mimeExt[blob.type] || (blob.type && blob.type.startsWith('video/') ? '.mp4' : blob.type && blob.type.startsWith('font/') ? '.woff2' : '');
+  }
   const fd = new FormData();
-  fd.append('file', blob, blob.name || 'asset');
+  fd.append('file', blob, filename);
   if (hash) fd.append('content_hash', hash);
   const res = await fetch(`${base}/assets/upload`, { method: 'POST', body: fd });
   if (!res.ok) throw new Error('Asset upload failed: ' + (await res.text()));
@@ -6432,7 +6472,8 @@ const startVideoRender = async () => {
           try {
             const record = await _imageDB.images.get(slot._dbId);
             if (record && record.blob) {
-              assetId = await uploadAsset(record.blob);
+              // Pass label so uploadAsset can construct a proper filename with extension
+              assetId = await uploadAsset(record.blob, null, slot._label || record.label);
               slot._assetId = assetId; // cache for next render
             }
           } catch (e) {
@@ -9974,7 +10015,12 @@ function useNodeManager(cb) {
         });
       }
       newNode._videoContent = slot0;  
-      newNode._videoSlots   = [slot0]; 
+      newNode._videoSlots   = [slot0];
+      // Background-upload the video blob to the render server immediately,
+      // same as _appendVideoSlot does — so _assetId is ready before render.
+      if (!slot0._assetId && newNodeForm.videoBlob) {
+        _uploadVideoSlotAsset(slot0, newNodeForm.videoBlob);
+      }
       if (isFirstNode) {
         
         cb.svgContent.value = '';
