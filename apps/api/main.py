@@ -1361,6 +1361,32 @@ async def playwright_render(req: PlaywrightRenderRequest, background_tasks: Back
 
     payload = req.model_dump()
 
+    # ── Remap payload fields to match what QweenRender.html buildDom() expects ──
+    # QweenApp sends camelCase keys; QweenRender reads underscore-prefixed names.
+    for node in payload.get("nodes", []):
+        # Bug 1 (server-side guard): svgContent -> _svgContent
+        if "svgContent" in node:
+            node["_svgContent"] = node.pop("svgContent")
+
+        # Bug 2: videoSlots[]{treeId, asset_id} -> _videoSlots[]{_treeId, src}
+        if node.get("type") == "video":
+            remapped = []
+            for slot in node.get("videoSlots") or []:
+                asset_id = slot.get("asset_id")
+                src = f"{RENDERER_URL}/assets/{asset_id}" if asset_id else ""
+                remapped.append({
+                    "_treeId":  slot.get("treeId", ""),
+                    "_label":   slot.get("label", ""),
+                    "src":      src,
+                    "mimeType": slot.get("mimeType", "video/mp4"),
+                })
+            node["_videoSlots"] = remapped
+            node.pop("videoSlots", None)
+
+    # Bug 3 (server-side guard): storedInitialStates -> initialStates
+    if "storedInitialStates" in payload and "initialStates" not in payload:
+        payload["initialStates"] = payload.pop("storedInitialStates")
+
     # Build a minimal project ZIP from the JSON payload so QweenRender.html
     # can load it the same way it loads a real exported project
     import io as _io
