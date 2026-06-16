@@ -3,15 +3,15 @@
   "setupTasks": [
     {
       "name": "Install ffmpeg + ffprobe",
-      "command": "sudo apt-get update -qq && sudo apt-get install -y ffmpeg && ffmpeg -version && ffprobe -version"
+      "command": "sudo apt-get update -qq && sudo apt-get install -y ffmpeg && ffmpeg -version"
     },
     {
       "name": "Install pnpm",
       "command": "npm install -g pnpm@9.1.0"
     },
     {
-      "name": "Install web dependencies",
-      "command": "cd apps/web && pnpm install"
+      "name": "Install Node deps (web + app)",
+      "command": "pnpm install"
     },
     {
       "name": "Install Python deps",
@@ -24,29 +24,36 @@
   ],
   "tasks": {
     "setup:env": {
-      "name": "⚙ Create .env files from .env.example",
-      "command": "[ -f apps/api/.env ] || cp apps/api/.env.example apps/api/.env; [ -f apps/web/.env.local ] || cp apps/web/.env.example apps/web/.env.local; echo 'Env files ready'"
+      "name": "⚙ Create .env from .env.example",
+      "command": "[ -f .env ] || cp .env.example .env; echo 'Env ready'"
+    },
+    "dev:app": {
+      "name": "▶ Run Renderer (Node :3000)",
+      "command": "cd apps/app && node server.js",
+      "preview": {
+        "port": 3000
+      }
     },
     "dev:api": {
-      "name": "\u25b6 Run API (FastAPI :8000)",
+      "name": "▶ Run API (FastAPI :8000)",
       "command": "cd apps/api && uvicorn main:app --reload --port 8000 --host 0.0.0.0",
       "preview": {
         "port": 8000
       }
     },
     "dev:web": {
-      "name": "\u25b6 Run Web (Next.js :3000)",
+      "name": "▶ Run Web (Next.js :3001)",
       "command": "cd apps/web && pnpm dev",
       "preview": {
-        "port": 3000
+        "port": 3001
       }
     },
     "health": {
-      "name": "\u2713 Health check",
+      "name": "✓ Health check",
       "command": "curl -s http://localhost:8000/health | python3 -m json.tool"
     },
     "typecheck": {
-      "name": "\u2713 TypeScript check",
+      "name": "✓ TypeScript check",
       "command": "cd apps/web && pnpm exec tsc --noEmit"
     }
   }
