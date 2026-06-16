@@ -1052,6 +1052,88 @@ def _run_playwright_render_safe(job_id: str, job_dir: Path, payload: dict, fmt: 
 #   start_time (default 0), end_time (default 0 = auto from tweens),
 #   stage_width / stage_height (default 0 = read from first node or 1920×1080)
 
+def _resolve_gsap_position(pos, seq_point: float, prev_start: float, labels: dict) -> float:
+    """Resolve a GSAP timeline position parameter to an absolute start time.
+    Mirrors timeline.add(child, position) semantics closely enough for
+    duration *estimation* — exact GSAP internals aren't reproduced, but
+    every common authoring pattern ('>', '<', '+=N', '-=N', a bare number,
+    a label, or omitted) resolves the same way GSAP would resolve it."""
+    if pos is None or pos == "":
+        return seq_point
+    if isinstance(pos, (int, float)):
+        return float(pos)
+    if isinstance(pos, str):
+        s = pos.strip()
+        if s == ">":
+            return seq_point
+        if s == "<":
+            return prev_start
+        if s.startswith("+=") or s.startswith("-="):
+            try:
+                offset = float(s[2:])
+            except ValueError:
+                offset = 0.0
+            return seq_point + (offset if s.startswith("+=") else -offset)
+        if s in labels:
+            return labels[s]
+        try:
+            return float(s)
+        except ValueError:
+            return seq_point  # unrecognised syntax (e.g. "<50%") — fail soft
+    return seq_point
+
+
+def _tween_own_duration(t: dict) -> float:
+    """A single tween/group's own playback length, honouring timingVars
+    (the real schema QweenApp exports) with a flat fallback for safety."""
+    tv = t.get("timingVars") or {}
+    dur = tv.get("duration", t.get("duration"))
+    try:
+        dur = float(dur) if dur is not None else 0.0
+    except (TypeError, ValueError):
+        dur = 0.0
+
+    repeat = tv.get("repeat", t.get("repeat", 0)) or 0
+    try:
+        repeat = float(repeat)
+    except (TypeError, ValueError):
+        repeat = 0.0
+    repeat_delay = tv.get("repeatDelay", t.get("repeatDelay", 0)) or 0
+    try:
+        repeat_delay = float(repeat_delay)
+    except (TypeError, ValueError):
+        repeat_delay = 0.0
+
+    if repeat > 0:  # finite repeats extend the tween's own length
+        dur += repeat * (dur + repeat_delay)
+    # repeat == -1 (infinite) is left as the base duration — extending the
+    # render to "infinity" isn't useful for a finite video export.
+    return max(dur, 0.0)
+
+
+def _estimate_timeline_end(tweens: list) -> float:
+    """Walk tweens in document order, resolving each one's GSAP-style
+    position ('>', '<', '+=N', '-=N', a number, a label, or omitted) to
+    estimate the master timeline's total extent. This is a heuristic —
+    only real GSAP (running in the browser) knows the exact duration —
+    but it's far closer than assuming flat top-level delay/duration
+    fields that this project format doesn't actually use."""
+    seq_point  = 0.0
+    prev_start = 0.0
+    max_end    = 0.0
+    labels: dict = {}
+    for t in tweens:
+        tv  = t.get("timingVars") or {}
+        pos = t.get("position", tv.get("position"))
+        start = _resolve_gsap_position(pos, seq_point, prev_start, labels)
+        dur   = _tween_own_duration(t)
+        end   = start + dur
+        max_end    = max(max_end, end)
+        seq_point  = end
+        prev_start = start
+    return round(max_end, 3)
+
+
 def _project_to_playwright_payload(project: dict, asset_map: dict,
                                     fps: float, crf: int, fmt: str,
                                     start_time: float, end_time: float,
@@ -1073,9 +1155,7 @@ def _project_to_playwright_payload(project: dict, asset_map: dict,
     # Resolve end_time: caller override > derive from tweens
     if end_time <= start_time:
         tweens = project.get("tweens", [])
-        end_time = max(
-            ((t.get("delay") or 0) + (t.get("duration") or 0)) for t in tweens
-        ) if tweens else 5.0
+        end_time = _estimate_timeline_end(tweens) if tweens else 5.0
         end_time = round(end_time, 3)
 
     # Build node list for the render payload
