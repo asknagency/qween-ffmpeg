@@ -15,16 +15,19 @@ from pathlib import Path
 _ENGINE_JS = (Path(__file__).parent / "engine.js").read_text()
 
 GSAP_VERSION = "3.13.0"
-_GSAP_PLUGIN_NAMES = [
-    "gsap",
-    "DrawSVGPlugin",
-    "MotionPathPlugin",
-    "MorphSVGPlugin",
-    "TextPlugin",
-    "ScrambleTextPlugin",
-    "Physics2DPlugin",
-    "EasePack",
-]
+_GSAP_PLUGIN_SCRIPTS = "\n".join(
+    f'  <script src="http://localhost:8000/test-gsap/{name}.min.js"></script>'
+    for name in [
+        "gsap",
+        "DrawSVGPlugin",
+        "MotionPathPlugin",
+        "MorphSVGPlugin",
+        "TextPlugin",
+        "ScrambleTextPlugin",
+        "Physics2DPlugin",
+        "EasePack",
+    ]
+)
 
 
 def _node_layer_html(node: dict, z: int, asset_base: str) -> str:
@@ -96,13 +99,6 @@ def build_stage_html(payload: dict, asset_base: str = "/assets") -> str:
     gsap_cdn = payload.get("gsapCdn") or f"https://cdnjs.cloudflare.com/ajax/libs/gsap/{GSAP_VERSION}/gsap.min.js"
     root_svg_id = payload.get("rootSvgId", "main-svg-root")
 
-    # Derive CDN base dir from the gsap.min.js URL so all plugins come from the same source
-    gsap_base = gsap_cdn.rsplit("/", 1)[0]
-    gsap_plugin_scripts = "\n".join(
-        f'  <script src="{gsap_base}/{name}.min.js"></script>'
-        for name in _GSAP_PLUGIN_NAMES
-    )
-
     # Sort nodes by zIndex (matches QweenApp's `ni + 2` stacking order)
     ordered_nodes = sorted(enumerate(nodes), key=lambda pair: pair[1].get("zIndex", pair[0]))
     layers_html = "".join(
@@ -143,7 +139,7 @@ def build_stage_html(payload: dict, asset_base: str = "/assets") -> str:
   video {{ background: transparent; }}
   {font_css}
 </style>
-{gsap_plugin_scripts}
+{_GSAP_PLUGIN_SCRIPTS}
 </head>
 <body>
 <div id="qween-stage">
