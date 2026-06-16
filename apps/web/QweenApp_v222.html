@@ -9108,7 +9108,9 @@ toRaw(swapTemplates.value).forEach(tpl => {
 });
 // Warm up all video elements so the browser has buffered enough data (readyState ≥ 3)
 // before GSAP starts issuing seeks. Without this the very first seek stalls.
-const videoEls = Array.from(container.querySelectorAll('video'));
+// NOTE: video elements live in node divs *outside* the SVG container, so
+// we must query from document, not from container.
+const videoEls = Array.from(document.querySelectorAll('video'));
 const warmUpVideo = (v) => new Promise((resolve) => {
   if (!v.src) return resolve();
   if (v.readyState >= 3) return resolve(); // HAVE_FUTURE_DATA — already good
