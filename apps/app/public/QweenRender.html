@@ -1225,7 +1225,9 @@ async function run() {
         ? node._videoSlots
         : (node._videoContent ? [node._videoContent] : []);
       for (const slot of slots) {
-        if (!slot || slot.src) continue;          // already has a src — skip
+        // Treat missing or stale blob:null/… URLs the same as absent src
+        const _srcIsStale = !slot.src || slot.src.startsWith('blob:null');
+        if (!slot || !_srcIsStale) continue;
         const assetFile = slot._assetFile || slot._label;
         if (!assetFile) continue;
         const entry = zip.file(`assets/${assetFile}`);

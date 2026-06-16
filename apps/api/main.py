@@ -993,6 +993,226 @@ def _remap_payload_for_render(payload: dict) -> dict:
     return payload
 
 
+def _resolve_asset_file(asset_id: str) -> Path | None:
+    """Return the Path of the actual media file for an asset_id, or None."""
+    asset_dir = ASSETS_DIR / asset_id
+    if not asset_dir.is_dir():
+        return None
+    for p in asset_dir.iterdir():
+        if p.name != "meta.json" and p.suffix.lower() in ASSET_VIDEO_EXTS:
+            return p
+    return None
+
+
+def _composite_video_layers(
+    job_id: str,
+    job_dir: Path,
+    frames_dir: Path,
+    payload: dict,
+    fps: float,
+    total_frames: int,
+) -> Path:
+    """
+    FFmpeg Option-B: composite video-node frames onto the PNG sequence
+    that Playwright captured (which has black rectangles where <video> was).
+
+    Strategy:
+      - The PNG frames are the base layer (from Playwright screenshots).
+      - For each video slot referenced by a _videoPlayConfig tween we:
+          1. Resolve the asset file on disk.
+          2. Work out: clip start/end in timeline time, source fromTime/toTime.
+          3. Use ffmpeg overlay with `enable='between(t,…)'` so the video only
+             appears during its active window, at the correct pixel position.
+      - All layers are composited in zIndex order (ascending = bottom first).
+      - The composited frames are written to a new PNG sequence in
+        job_dir/frames_comp/ and that path is returned.
+      - If there are no compositable video layers (missing assets etc.) the
+        original frames_dir is returned unchanged.
+
+    Geometry:
+      The video node fills the full stage (position: absolute; inset: 0;
+      width/height: 100%) using object-fit: contain.  At render time the
+      viewport equals the stage (stage_w × stage_h), so the video is
+      letter/pillar-boxed to fit.  We replicate that here with ffmpeg's
+      scale + pad filters so the overlay matches exactly what the browser
+      would paint (if it could).
+    """
+    stage_w = payload.get("stageWidth", 1920)
+    stage_h = payload.get("stageHeight", 1080)
+    start_time = payload.get("startTime", 0) or 0
+
+    # ── 1. Collect _videoPlayConfig entries from tweens ────────────────────────
+    # Each entry: {slotId, fromTime, toTime, tween_position, tween_duration}
+    # We also need the node's zIndex so we can overlay in the right order.
+    tweens = payload.get("tweens", [])
+
+    # Build a map: slotId → asset info (asset_id, mimeType, node zIndex)
+    nodes = payload.get("nodes", []) or payload.get("nodes", [])
+    slot_to_asset: dict[str, dict] = {}
+    slot_to_zindex: dict[str, int] = {}
+    for node in nodes:
+        if node.get("type") != "video":
+            continue
+        z = node.get("zIndex", 0)
+        # Slots may be in videoSlots (pre-remap) or _videoSlots (post-remap)
+        slots = node.get("videoSlots") or node.get("_videoSlots") or []
+        for slot in slots:
+            tree_id  = slot.get("treeId") or slot.get("_treeId", "")
+            asset_id = slot.get("asset_id") or slot.get("_assetId") or ""
+            if tree_id and asset_id:
+                slot_to_asset[tree_id]  = {"asset_id": asset_id, "mimeType": slot.get("mimeType", "video/mp4")}
+                slot_to_zindex[tree_id] = z
+
+    # Also check videoAssets list built by _project_to_playwright_payload
+    for va in payload.get("videoAssets", []):
+        slot_id  = va.get("slotId", "")
+        asset_id = va.get("asset_id", "")
+        if slot_id and asset_id and slot_id not in slot_to_asset:
+            slot_to_asset[slot_id]  = {"asset_id": asset_id, "mimeType": va.get("mimeType", "video/mp4")}
+            # zIndex unknown from videoAssets alone; leave 0
+
+    # ── 2. Parse tweens for _videoPlayConfig ──────────────────────────────────
+    class VidClip:
+        def __init__(self, slot_id, asset_path, from_time, to_time, tl_start, tl_end, z):
+            self.slot_id    = slot_id
+            self.asset_path = asset_path
+            self.from_time  = from_time   # source video start time (seconds)
+            self.to_time    = to_time     # source video end time (seconds)
+            self.tl_start   = tl_start    # timeline position this clip becomes active
+            self.tl_end     = tl_end      # timeline position this clip ends
+            self.z          = z
+
+    clips: list[VidClip] = []
+    for tween in tweens:
+        vpc = (
+            tween.get("_videoPlayConfig")
+            or (tween.get("timingVars") or {}).get("_videoPlayConfig")
+        )
+        if not vpc:
+            continue
+        slot_id   = vpc.get("slotId", "")
+        from_time = float(vpc.get("fromTime", 0))
+        to_time   = float(vpc.get("toTime", 0))
+        if not slot_id or slot_id not in slot_to_asset:
+            continue
+        asset_id  = slot_to_asset[slot_id]["asset_id"]
+        asset_path = _resolve_asset_file(asset_id)
+        if asset_path is None:
+            continue
+
+        # Determine timeline window for this clip.
+        # The tween position may be a number or GSAP label (">", "+=N" etc.).
+        # We use a simple heuristic: parse numeric position; treat ">" as
+        # sequential (place after previous clip).  For a full GSAP resolver
+        # see _estimate_timeline_end.
+        tv = tween.get("timingVars") or {}
+        duration = float(tv.get("duration", to_time - from_time) or (to_time - from_time))
+
+        pos_raw = str(tween.get("position") or tv.get("position") or "0")
+        try:
+            tl_start = float(pos_raw) if pos_raw not in (">", "") else (clips[-1].tl_end if clips else 0.0)
+        except ValueError:
+            tl_start = 0.0
+        tl_end = tl_start + duration
+
+        z = slot_to_zindex.get(slot_id, 0)
+        clips.append(VidClip(slot_id, asset_path, from_time, to_time, tl_start, tl_end, z))
+
+    if not clips:
+        return frames_dir  # nothing to composite — use original frames as-is
+
+    # Sort clips bottom → top by zIndex
+    clips.sort(key=lambda c: c.z)
+
+    # ── 3. Build FFmpeg filter_complex to composite everything ─────────────────
+    #
+    # Input 0  : PNG frame sequence (base, from Playwright)
+    # Input 1…N: video asset files  (one per unique clip)
+    #
+    # Filter chain per clip i:
+    #   [i+1:v] trim=start=<from>:end=<to>, setpts=PTS-STARTPTS,
+    #           scale=<fit_w>:<fit_h>:force_original_aspect_ratio=decrease,
+    #           pad=<stage_w>:<stage_h>:(ow-iw)/2:(oh-ih)/2,
+    #           setsar=1
+    #           → [vid_i]
+    #
+    #   [base_i][vid_i] overlay=0:0:enable='between(t,<tl_start>,<tl_end>)'
+    #           → [comp_i]   (which becomes [base_{i+1}])
+    #
+    # Final output: [comp_{N-1}]
+    #
+    # We then encode directly to a lossless intermediate so we don't re-encode
+    # twice; the caller will encode to the final format.
+
+    comp_dir = job_dir / "frames_comp"
+    comp_dir.mkdir(exist_ok=True)
+
+    ffmpeg_inputs = ["-framerate", str(fps), "-i", str(frames_dir / "frame_%06d.png")]
+    for clip in clips:
+        ffmpeg_inputs += ["-i", str(clip.asset_path)]
+
+    filter_parts: list[str] = []
+    current_label = "0:v"
+
+    for idx, clip in enumerate(clips):
+        input_idx = idx + 1  # input 0 = PNGs
+        vid_label  = f"vid{idx}"
+        comp_label = f"comp{idx}"
+
+        # Replicate CSS object-fit:contain at stage_w × stage_h
+        scale_filter = (
+            f"[{input_idx}:v]"
+            f"trim=start={clip.from_time}:end={clip.to_time},"
+            f"setpts=PTS-STARTPTS,"
+            f"scale={stage_w}:{stage_h}:force_original_aspect_ratio=decrease,"
+            f"pad={stage_w}:{stage_h}:(ow-iw)/2:(oh-ih)/2,"
+            f"setsar=1"
+            f"[{vid_label}]"
+        )
+        filter_parts.append(scale_filter)
+
+        overlay_filter = (
+            f"[{current_label}][{vid_label}]"
+            f"overlay=0:0:enable='between(t,{clip.tl_start},{clip.tl_end})'"
+            f"[{comp_label}]"
+        )
+        filter_parts.append(overlay_filter)
+        current_label = comp_label
+
+    filter_complex = ";".join(filter_parts)
+
+    # Encode composited frames to an intermediate lossless video, then split
+    # back to PNGs so the existing stitch logic (gif/mp4/webm) is unchanged.
+    intermediate = job_dir / "composited_intermediate.mp4"
+    comp_args = (
+        ffmpeg_inputs
+        + ["-filter_complex", filter_complex, "-map", f"[{current_label}]"]
+        + ["-c:v", "libx264", "-crf", "0", "-preset", "ultrafast", "-pix_fmt", "yuv444p"]
+        + [str(intermediate)]
+    )
+    code, _, err = run_ffmpeg_queued(comp_args)
+    if code != 0:
+        # Compositing failed — log and fall back to original frames
+        import sys
+        print(f"[QweenFFmpeg] Video composite failed for job {job_id}: {err}", file=sys.stderr)
+        return frames_dir
+
+    # Explode intermediate back to PNGs
+    explode_args = [
+        "-i", str(intermediate),
+        "-vsync", "0",
+        str(comp_dir / "frame_%06d.png"),
+    ]
+    code2, _, err2 = run_ffmpeg_queued(explode_args)
+    if code2 != 0:
+        import sys
+        print(f"[QweenFFmpeg] Frame explode failed for job {job_id}: {err2}", file=sys.stderr)
+        return frames_dir
+
+    intermediate.unlink(missing_ok=True)
+    return comp_dir
+
+
 def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
                             fps: float, crf: int):
     import asyncio
@@ -1072,11 +1292,20 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
 
     asyncio.run(_render())
 
-    _job_update(job_id, status="processing", message="Stitching frames…", progress=74)
+    # ── Option-B: composite video layers onto the PNG sequence ─────────────────
+    # Playwright screenshots have black where <video> elements lived.  We extract
+    # those frames directly from the source assets via FFmpeg and overlay them at
+    # the correct timeline positions.
+    _job_update(job_id, status="processing", message="Compositing video layers…", progress=74)
+    stitch_dir = _composite_video_layers(
+        job_id, job_dir, frames_dir, payload, fps, total_frames
+    )
+
+    _job_update(job_id, status="processing", message="Stitching frames…", progress=84)
 
     output = output_path_for(job_dir, fmt)
     cfg = FORMAT_CONFIG[fmt]
-    input_pattern = str(frames_dir / "frame_%06d.png")
+    input_pattern = str(stitch_dir / "frame_%06d.png")
     if fmt == "gif":
         code, err = stitch_to_gif(input_pattern, fps, job_dir, output)
     else:
