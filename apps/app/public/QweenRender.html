@@ -1288,6 +1288,48 @@ async function run() {
     window.__qween_frame_ready = false;
     window.__qween_master_tl   = null;
 
+    // __qween_set_layer_mode(mode, videoNodeIds)
+    // Used by the Python renderer for multi-pass video compositing.
+    // mode:
+    //   'normal'       — all nodes visible, opaque black background (default)
+    //   'below_video'  — only nodes whose DOM zIndex is BELOW the lowest video node;
+    //                    body/html background set transparent for PNG alpha capture
+    //   'above_video'  — only nodes whose DOM zIndex is ABOVE the highest video node;
+    //                    body/html background set transparent for PNG alpha capture
+    // videoNodeIds: array of node div IDs that are video nodes (e.g. ['node-2'])
+    window.__qween_set_layer_mode = function(mode, videoNodeIds) {
+      const nodeEls = Array.from(document.querySelectorAll('.qw-node'));
+
+      // Collect video node zIndexes
+      const videoZIndexes = (videoNodeIds || [])
+        .map(id => document.getElementById(id))
+        .filter(Boolean)
+        .map(el => parseInt(el.style.zIndex, 10) || 0);
+
+      const minVideoZ = videoZIndexes.length ? Math.min(...videoZIndexes) : Infinity;
+      const maxVideoZ = videoZIndexes.length ? Math.max(...videoZIndexes) : -Infinity;
+
+      if (mode === 'normal') {
+        document.documentElement.style.background = '';
+        document.body.style.background = '';
+        nodeEls.forEach(el => { el.style.visibility = ''; });
+      } else if (mode === 'below_video') {
+        document.documentElement.style.background = 'transparent';
+        document.body.style.background = 'transparent';
+        nodeEls.forEach(el => {
+          const z = parseInt(el.style.zIndex, 10) || 0;
+          el.style.visibility = z < minVideoZ ? 'visible' : 'hidden';
+        });
+      } else if (mode === 'above_video') {
+        document.documentElement.style.background = 'transparent';
+        document.body.style.background = 'transparent';
+        nodeEls.forEach(el => {
+          const z = parseInt(el.style.zIndex, 10) || 0;
+          el.style.visibility = z > maxVideoZ ? 'visible' : 'hidden';
+        });
+      }
+    };
+
     window.__qween_seek = async function(t) {
       window.__qween_frame_ready = false;
       const masterTl = window.__qween_master_tl;
