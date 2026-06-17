@@ -953,14 +953,6 @@ class PlaywrightRenderRequest(BaseModel):
     swapTemplates: List[Dict[str, Any]] = []
     storedInitialStates: List[Dict[str, Any]] = []
     gsapCdn: Optional[str] = None
-    # Video render strategy:
-    #   "swiftshader" — headless Chromium with SwiftShader software GPU;
-    #                   page.screenshot() captures composited video in a single
-    #                   pass. Best quality/simplicity tradeoff. DEFAULT.
-    #   "sandwich"    — three-pass headless capture (below-video SVGs, video via
-    #                   FFmpeg overlay, above-video SVGs) for environments where
-    #                   SwiftShader is unavailable or too slow.
-    video_render_mode: str = "swiftshader"
 
 
 # /render-stage removed — Playwright now loads QweenRender.html directly
@@ -1199,7 +1191,7 @@ def _composite_video_layers(
 
 
 def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
-                            fps: float, crf: int, video_render_mode: str = "swiftshader"):
+                            fps: float, crf: int):
     import asyncio
     from playwright.async_api import async_playwright
 
@@ -1220,37 +1212,19 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
     stage_h    = payload.get("stageHeight", 1080)
     total_frames = max(1, math.ceil((end_time - start_time) * fps))
 
-    # Detect video nodes — needed for sandwich mode; harmless in swiftshader mode
+    # Detect whether there are any video nodes in this project, and if so
+    # collect their node-div IDs for the layer-mode API in QweenRender.html.
+    # We need this before launching Playwright so we know whether to do
+    # single-pass (no video) or three-pass (with video) rendering.
     nodes_in_payload = payload.get("nodes", [])
-    video_node_ids   = [n["id"] for n in nodes_in_payload if n.get("type") == "video"]
-    has_video_nodes  = bool(video_node_ids)
+    video_node_ids = [n["id"] for n in nodes_in_payload if n.get("type") == "video"]
+    has_video_nodes = bool(video_node_ids)
 
-    # Sandwich-mode extra frame dirs (only allocated when needed)
-    frames_below_dir = job_dir / "frames_below"
-    frames_above_dir = job_dir / "frames_above"
-    use_sandwich = (video_render_mode == "sandwich") and has_video_nodes
-    if use_sandwich:
+    frames_below_dir = job_dir / "frames_below"  # below-video SVG layers (transparent bg)
+    frames_above_dir = job_dir / "frames_above"  # above-video SVG layers (transparent bg)
+    if has_video_nodes:
         frames_below_dir.mkdir(exist_ok=True)
         frames_above_dir.mkdir(exist_ok=True)
-
-    # ── Chromium launch args ───────────────────────────────────────────────────
-    # swiftshader mode: force full software GPU compositing so page.screenshot()
-    # captures <video> pixels correctly in a single pass, no FFmpeg overlay needed.
-    # sandwich mode:    standard headless (video pixels will be black; composited
-    #                   separately by _composite_video_layers).
-    if video_render_mode == "swiftshader":
-        browser_args = [
-            "--autoplay-policy=no-user-gesture-required",
-            "--disable-web-security",
-            "--use-gl=angle",           # force ANGLE GL backend
-            "--use-angle=swiftshader",  # ANGLE uses SwiftShader software renderer
-            "--ignore-gpu-blocklist",   # allow SW compositing even when GPU blocklisted
-        ]
-    else:
-        browser_args = [
-            "--autoplay-policy=no-user-gesture-required",
-            "--disable-web-security",
-        ]
 
     async def _render():
         # Rebuild the project ZIP from the already-remapped payload so QweenRender
@@ -1283,35 +1257,44 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
         )
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(args=browser_args)
+            browser = await p.chromium.launch(args=[
+                "--autoplay-policy=no-user-gesture-required",
+                "--disable-web-security",
+            ])
             page = await browser.new_page(viewport={"width": stage_w, "height": stage_h})
             try:
                 await page.goto(render_url, wait_until="networkidle", timeout=60_000)
                 await page.wait_for_function("window.__qween_ready === true", timeout=120_000)
 
-                if video_render_mode == "swiftshader":
-                    # ── SwiftShader single pass ────────────────────────────────
-                    # Software GPU composites <video> pixels into the framebuffer,
-                    # so page.screenshot() captures everything correctly in one pass.
-                    # No FFmpeg overlay step needed. z-order is handled by the browser.
-                    _job_update(job_id, message="SwiftShader render — capturing frames…", progress=5)
-                    for i in range(total_frames):
-                        t = start_time + (i / fps)
-                        await page.evaluate("async (t) => { await window.__qween_seek(t); }", t)
-                        await page.wait_for_function("window.__qween_frame_ready === true", timeout=30_000)
-                        await page.screenshot(
-                            path=str(frames_dir / f"frame_{i:06d}.png"),
-                            clip={"x": 0, "y": 0, "width": stage_w, "height": stage_h},
-                        )
-                        _job_update(job_id,
-                                     progress=5 + int((i + 1) / total_frames * 65),
-                                     message=f"Frame {i+1}/{total_frames}")
+                # ── Pass 1: normal render (all nodes visible) ──────────────────
+                # SVG layers paint correctly; video nodes paint as opaque black.
+                # We only use this pass when there are no video nodes, OR as a
+                # fallback.  When video nodes exist we skip this pass and use
+                # the below/above passes instead, which give us transparent PNGs
+                # we can sandwich around the FFmpeg video.
+                # We still run pass 1 so callers get frames_dir populated even
+                # if compositing later fails (graceful fallback).
+                await page.evaluate(
+                    "(ids) => window.__qween_set_layer_mode && window.__qween_set_layer_mode('normal', ids)",
+                    video_node_ids,
+                )
+                for i in range(total_frames):
+                    t = start_time + (i / fps)
+                    await page.evaluate("async (t) => { await window.__qween_seek(t); }", t)
+                    await page.wait_for_function("window.__qween_frame_ready === true", timeout=30_000)
+                    await page.screenshot(
+                        path=str(frames_dir / f"frame_{i:06d}.png"),
+                        clip={"x": 0, "y": 0, "width": stage_w, "height": stage_h},
+                    )
+                    _job_update(job_id, progress=int((i + 1) / total_frames * 24),
+                                 message=f"Pass 1/3 — frame {i+1}/{total_frames}")
 
-                else:
-                    # ── Sandwich three-pass ────────────────────────────────────
-                    # Pass 1: normal (all nodes) — fallback frames if composite fails
+                if has_video_nodes:
+                    # ── Pass 2: below-video nodes only, transparent background ──
+                    # Shows only SVG/text nodes whose DOM zIndex is below every
+                    # video node.  PNG alpha channel is preserved (omit -pix_fmt).
                     await page.evaluate(
-                        "(ids) => window.__qween_set_layer_mode && window.__qween_set_layer_mode('normal', ids)",
+                        "(ids) => window.__qween_set_layer_mode('below_video', ids)",
                         video_node_ids,
                     )
                     for i in range(total_frames):
@@ -1319,71 +1302,53 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
                         await page.evaluate("async (t) => { await window.__qween_seek(t); }", t)
                         await page.wait_for_function("window.__qween_frame_ready === true", timeout=30_000)
                         await page.screenshot(
-                            path=str(frames_dir / f"frame_{i:06d}.png"),
+                            path=str(frames_below_dir / f"frame_{i:06d}.png"),
                             clip={"x": 0, "y": 0, "width": stage_w, "height": stage_h},
+                            omit_background=True,
                         )
-                        _job_update(job_id, progress=5 + int((i + 1) / total_frames * 20),
-                                     message=f"Pass 1/3 — frame {i+1}/{total_frames}")
+                        _job_update(job_id, progress=24 + int((i + 1) / total_frames * 24),
+                                     message=f"Pass 2/3 — frame {i+1}/{total_frames}")
 
-                    if use_sandwich:
-                        # Pass 2: below-video nodes only, transparent background
-                        await page.evaluate(
-                            "(ids) => window.__qween_set_layer_mode('below_video', ids)",
-                            video_node_ids,
+                    # ── Pass 3: above-video nodes only, transparent background ──
+                    await page.evaluate(
+                        "(ids) => window.__qween_set_layer_mode('above_video', ids)",
+                        video_node_ids,
+                    )
+                    for i in range(total_frames):
+                        t = start_time + (i / fps)
+                        await page.evaluate("async (t) => { await window.__qween_seek(t); }", t)
+                        await page.wait_for_function("window.__qween_frame_ready === true", timeout=30_000)
+                        await page.screenshot(
+                            path=str(frames_above_dir / f"frame_{i:06d}.png"),
+                            clip={"x": 0, "y": 0, "width": stage_w, "height": stage_h},
+                            omit_background=True,
                         )
-                        for i in range(total_frames):
-                            t = start_time + (i / fps)
-                            await page.evaluate("async (t) => { await window.__qween_seek(t); }", t)
-                            await page.wait_for_function("window.__qween_frame_ready === true", timeout=30_000)
-                            await page.screenshot(
-                                path=str(frames_below_dir / f"frame_{i:06d}.png"),
-                                clip={"x": 0, "y": 0, "width": stage_w, "height": stage_h},
-                                omit_background=True,
-                            )
-                            _job_update(job_id, progress=25 + int((i + 1) / total_frames * 20),
-                                         message=f"Pass 2/3 — frame {i+1}/{total_frames}")
+                        _job_update(job_id, progress=48 + int((i + 1) / total_frames * 24),
+                                     message=f"Pass 3/3 — frame {i+1}/{total_frames}")
 
-                        # Pass 3: above-video nodes only, transparent background
-                        await page.evaluate(
-                            "(ids) => window.__qween_set_layer_mode('above_video', ids)",
-                            video_node_ids,
-                        )
-                        for i in range(total_frames):
-                            t = start_time + (i / fps)
-                            await page.evaluate("async (t) => { await window.__qween_seek(t); }", t)
-                            await page.wait_for_function("window.__qween_frame_ready === true", timeout=30_000)
-                            await page.screenshot(
-                                path=str(frames_above_dir / f"frame_{i:06d}.png"),
-                                clip={"x": 0, "y": 0, "width": stage_w, "height": stage_h},
-                                omit_background=True,
-                            )
-                            _job_update(job_id, progress=45 + int((i + 1) / total_frames * 20),
-                                         message=f"Pass 3/3 — frame {i+1}/{total_frames}")
-
-                        await page.evaluate(
-                            "(ids) => window.__qween_set_layer_mode('normal', ids)",
-                            video_node_ids,
-                        )
+                    # Restore normal mode (good practice even though page closes next)
+                    await page.evaluate(
+                        "(ids) => window.__qween_set_layer_mode('normal', ids)",
+                        video_node_ids,
+                    )
 
             finally:
                 await browser.close()
+                # Clean up project ZIP after render
                 project_zip_path.unlink(missing_ok=True)
 
     asyncio.run(_render())
 
-    # ── Composite step (sandwich mode only) ───────────────────────────────────
-    # SwiftShader mode: browser already composited everything correctly — go
-    # straight to stitch.
-    # Sandwich mode: FFmpeg overlays the video between the two SVG PNG sequences.
-    if use_sandwich:
-        _job_update(job_id, status="processing", message="Compositing video layers…", progress=70)
-        stitch_dir = _composite_video_layers(
-            job_id, job_dir, frames_dir, payload, fps, total_frames,
-            frames_below_dir=frames_below_dir,
-            frames_above_dir=frames_above_dir,
-        )
-    else:
-        stitch_dir = frames_dir
+    # ── Option-B: composite video layers with correct z-ordering ──────────────
+    # Three-layer composite: [below-video SVGs] → [video] → [above-video SVGs]
+    # The below/above PNG sequences have transparent backgrounds so they can be
+    # overlaid without clobbering each other.
+    _job_update(job_id, status="processing", message="Compositing video layers…", progress=74)
+    stitch_dir = _composite_video_layers(
+        job_id, job_dir, frames_dir, payload, fps, total_frames,
+        frames_below_dir=frames_below_dir if has_video_nodes else None,
+        frames_above_dir=frames_above_dir if has_video_nodes else None,
+    )
 
     _job_update(job_id, status="processing", message="Stitching frames…", progress=84)
 
@@ -1408,9 +1373,9 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
 
 
 def _run_playwright_render_safe(job_id: str, job_dir: Path, payload: dict, fmt: str,
-                                 fps: float, crf: int, video_render_mode: str = "swiftshader"):
+                                 fps: float, crf: int):
     try:
-        _run_playwright_render(job_id, job_dir, payload, fmt, fps, crf, video_render_mode)
+        _run_playwright_render(job_id, job_dir, payload, fmt, fps, crf)
     except Exception as e:
         _job_update(job_id, status="error", message=str(e), progress=0)
     finally:
@@ -1691,15 +1656,14 @@ def _project_to_playwright_payload(project: dict, asset_map: dict,
 
 @app.post("/jobs/render-project")
 async def render_project(
-    file:              UploadFile = File(...),
-    fps:               float = Form(30),
-    crf:               int   = Form(18),
-    format:            str   = Form("mp4"),
-    start_time:        float = Form(0),
-    end_time:          float = Form(0),
-    stage_width:       int   = Form(0),
-    stage_height:      int   = Form(0),
-    video_render_mode: str   = Form("swiftshader"),
+    file:         UploadFile = File(...),
+    fps:          float = Form(30),
+    crf:          int   = Form(18),
+    format:       str   = Form("mp4"),
+    start_time:   float = Form(0),
+    end_time:     float = Form(0),
+    stage_width:  int   = Form(0),
+    stage_height: int   = Form(0),
 ):
     """Accept a QweenApp project ZIP (or bare project.json) and render it to video.
 
@@ -1797,24 +1761,22 @@ async def render_project(
 
     # Attach the raw ZIP bytes so _run_playwright_render can save them to
     # apps/app/public/projects/{job_id}.zip for QweenRender.html to fetch
-    payload["_project_zip"]       = raw
-    payload["video_render_mode"]  = video_render_mode
+    payload["_project_zip"] = raw
 
     threading.Thread(
         target=_run_playwright_render_safe,
-        args=(job_id, job_dir, payload, fmt, fps, crf, video_render_mode),
+        args=(job_id, job_dir, payload, fmt, fps, crf),
         daemon=True,
     ).start()
 
     return {
-        "job_id":            job_id,
-        "status":            "queued",
-        "poll_url":          f"/jobs/{job_id}/status",
-        "end_time":          payload["endTime"],
-        "stage":             f"{payload['stageWidth']}×{payload['stageHeight']}",
-        "format":            fmt,
-        "fps":               fps,
-        "video_render_mode": video_render_mode,
+        "job_id":    job_id,
+        "status":    "queued",
+        "poll_url":  f"/jobs/{job_id}/status",
+        "end_time":  payload["endTime"],
+        "stage":     f"{payload['stageWidth']}×{payload['stageHeight']}",
+        "format":    fmt,
+        "fps":       fps,
     }
 
 
@@ -1846,13 +1808,9 @@ async def playwright_render(req: PlaywrightRenderRequest, background_tasks: Back
 
     t = threading.Thread(
         target=_run_playwright_render_safe,
-        args=(job_id, job_dir, payload, fmt, req.fps, req.crf, req.video_render_mode),
+        args=(job_id, job_dir, payload, fmt, req.fps, req.crf),
+        daemon=True,
     )
     t.start()
 
-    return {
-        "job_id":            job_id,
-        "status":            "queued",
-        "poll_url":          f"/jobs/{job_id}/status",
-        "video_render_mode": req.video_render_mode,
-    }
+    return {"job_id": job_id, "status": "queued", "poll_url": f"/jobs/{job_id}/status"}
