@@ -1011,20 +1011,24 @@ def _composite_video_layers(
     payload: dict,
     fps: float,
     total_frames: int,
-    frames_below_dir: Path | None = None,
-    frames_above_dir: Path | None = None,
+    frames_band_dirs: list[Path] | None = None,
+    video_node_order: list[str] | None = None,
 ) -> Path:
     """
     FFmpeg Option-B: composite video-node frames onto the PNG sequence
     that Playwright captured, preserving correct z-order.
 
-    Three-layer composite (when frames_below_dir / frames_above_dir provided):
-      1. frames_below_dir — transparent-bg PNGs of SVG nodes below video
-      2. video asset       — extracted at the correct source timestamps
-      3. frames_above_dir — transparent-bg PNGs of SVG nodes above video
+    N-band composite (when frames_band_dirs / video_node_order provided):
+      Generalizes the old fixed below→video→above sandwich to support any
+      number of stacked video nodes, in any order, including layers that sit
+      between two videos. With M video nodes in z-order (video_node_order)
+      there are M+1 transparent SVG bands (frames_band_dirs[0..M]); band k
+      covers everything strictly between video node k-1 and video node k
+      (band 0 has no floor, band M has no ceiling). The chain alternates:
+        band[0] → video[0]'s clips → band[1] → video[1]'s clips → … → band[M]
 
-    Fallback (no below/above dirs, e.g. no video nodes or first-time error):
-      Returns frames_dir unchanged.
+    Fallback (fewer than 2 band dirs, or no video_node_order, e.g. no video
+    nodes or first-time error): returns frames_dir unchanged.
 
     Geometry:
       Each video node fills the full stage (position: absolute; inset: 0;
@@ -1035,12 +1039,14 @@ def _composite_video_layers(
     stage_h    = payload.get("stageHeight", 1080)
     start_time = payload.get("startTime", 0) or 0
 
-    # If no layer dirs supplied there's nothing to composite
-    if frames_below_dir is None or frames_above_dir is None:
+    # Need at least 2 bands (below + above a single video) and a video order
+    # to know how to interleave them.
+    if not frames_band_dirs or len(frames_band_dirs) < 2 or not video_node_order:
         return frames_dir
 
-    # ── 1. Build slot → asset map ──────────────────────────────────────────────
+    # ── 1. Build slot → asset map, and slot → owning video-node map ───────────
     slot_to_asset: dict[str, dict] = {}
+    slot_to_node: dict[str, str] = {}
     for node in payload.get("nodes", []):
         if node.get("type") != "video":
             continue
@@ -1048,6 +1054,8 @@ def _composite_video_layers(
         for slot in slots:
             tree_id  = slot.get("treeId") or slot.get("_treeId", "")
             asset_id = slot.get("asset_id") or slot.get("_assetId") or ""
+            if tree_id:
+                slot_to_node[tree_id] = node.get("id", "")
             if tree_id and asset_id:
                 slot_to_asset[tree_id] = {"asset_id": asset_id}
 
@@ -1059,12 +1067,13 @@ def _composite_video_layers(
 
     # ── 2. Parse tweens for _videoPlayConfig ──────────────────────────────────
     class VidClip:
-        def __init__(self, asset_path, from_time, to_time, tl_start, tl_end):
+        def __init__(self, asset_path, from_time, to_time, tl_start, tl_end, node_id):
             self.asset_path = asset_path
             self.from_time  = from_time
             self.to_time    = to_time
             self.tl_start   = tl_start
             self.tl_end     = tl_end
+            self.node_id    = node_id
 
     clips: list[VidClip] = []
     for tween in payload.get("tweens", []):
@@ -1091,7 +1100,8 @@ def _composite_video_layers(
         except ValueError:
             tl_start = 0.0
         tl_end = tl_start + duration
-        clips.append(VidClip(asset_path, from_time, to_time, tl_start, tl_end))
+        node_id = slot_to_node.get(slot_id, "")
+        clips.append(VidClip(asset_path, from_time, to_time, tl_start, tl_end, node_id))
 
     if not clips:
         return frames_dir  # no compositable clips — use original frames
@@ -1099,66 +1109,73 @@ def _composite_video_layers(
     # ── 3. Build FFmpeg filter_complex ────────────────────────────────────────
     #
     # Inputs:
-    #   0 : frames_below_%06d.png  (below-video SVG, transparent bg, RGBA)
-    #   1 : frames_above_%06d.png  (above-video SVG, transparent bg, RGBA)
-    #   2…N: video asset files
+    #   0…M : frames_band{0..M}_%06d.png — one transparent SVG band per gap
+    #         between (and around) the stacked video nodes, where M+1 ==
+    #         len(video_node_order).
+    #   M+1…: video asset files, one per clip.
     #
-    # For each clip i (input index = i+2):
-    #   [i+2:v] trim+setpts+scale+pad+setsar → [vid_i]
+    # Chain (generalizes the old fixed below→video→above sandwich to any
+    # number of stacked videos):
+    #   start on band[0] (the lowest layer)
+    #   for each video node k in ascending z-order:
+    #     overlay that node's clips, each with enable='between(t,...)'
+    #     overlay band[k+1] on top (alpha-blended)
+    #   → final_out
     #
-    # Final composite (chained):
-    #   Start with [0:v] (below SVG) as base.
-    #   Overlay each [vid_i] with enable='between(t,...)'  → [after_vid]
-    #   Overlay [1:v] (above SVG, alpha-blended) on top   → [out]
-    #
-    # overlay filter uses format=auto so RGBA alpha from the above-SVG PNG
-    # is respected and blended correctly.
+    # overlay filter uses format=auto so RGBA alpha from each band PNG is
+    # respected and blended correctly.
 
     comp_dir = job_dir / "frames_comp"
     comp_dir.mkdir(exist_ok=True)
 
-    ffmpeg_inputs = [
-        "-framerate", str(fps), "-i", str(frames_below_dir / "frame_%06d.png"),
-        "-framerate", str(fps), "-i", str(frames_above_dir / "frame_%06d.png"),
-    ]
+    ffmpeg_inputs: list[str] = []
+    for band_dir in frames_band_dirs:
+        ffmpeg_inputs += ["-framerate", str(fps), "-i", str(band_dir / "frame_%06d.png")]
+    clip_input_base = len(frames_band_dirs)
     for clip in clips:
         ffmpeg_inputs += ["-i", str(clip.asset_path)]
 
     filter_parts: list[str] = []
-    # Start compositing on top of the below-video SVG base
-    current_label = "0:v"
+    current_label = "0:v"  # band 0, the lowest layer
 
-    for idx, clip in enumerate(clips):
-        input_idx  = idx + 2  # inputs 0 and 1 are the two SVG PNG sequences
-        vid_label  = f"vid{idx}"
-        comp_label = f"comp{idx}"
+    for k, node_id in enumerate(video_node_order):
+        for global_idx, clip in enumerate(clips):
+            if clip.node_id != node_id:
+                continue
+            input_idx  = clip_input_base + global_idx
+            vid_label  = f"vid{global_idx}"
+            comp_label = f"comp{global_idx}"
 
-        # Replicate CSS object-fit:contain at stage_w × stage_h
-        scale_filter = (
-            f"[{input_idx}:v]"
-            f"trim=start={clip.from_time}:end={clip.to_time},"
-            f"setpts=PTS-STARTPTS,"
-            f"scale={stage_w}:{stage_h}:force_original_aspect_ratio=decrease,"
-            f"pad={stage_w}:{stage_h}:(ow-iw)/2:(oh-ih)/2,"
-            f"setsar=1"
-            f"[{vid_label}]"
+            # Replicate CSS object-fit:contain at stage_w × stage_h
+            scale_filter = (
+                f"[{input_idx}:v]"
+                f"trim=start={clip.from_time}:end={clip.to_time},"
+                f"setpts=PTS-STARTPTS,"
+                f"scale={stage_w}:{stage_h}:force_original_aspect_ratio=decrease,"
+                f"pad={stage_w}:{stage_h}:(ow-iw)/2:(oh-ih)/2,"
+                f"setsar=1"
+                f"[{vid_label}]"
+            )
+            filter_parts.append(scale_filter)
+
+            overlay_filter = (
+                f"[{current_label}][{vid_label}]"
+                f"overlay=0:0:enable='between(t,{clip.tl_start},{clip.tl_end})'"
+                f"[{comp_label}]"
+            )
+            filter_parts.append(overlay_filter)
+            current_label = comp_label
+
+        # Overlay the next band (with alpha) on top before moving up to the
+        # next video node in the stack.
+        band_label      = f"{k + 1}:v"
+        comp_band_label = f"compband{k}"
+        filter_parts.append(
+            f"[{current_label}][{band_label}]overlay=0:0:format=auto[{comp_band_label}]"
         )
-        filter_parts.append(scale_filter)
+        current_label = comp_band_label
 
-        overlay_filter = (
-            f"[{current_label}][{vid_label}]"
-            f"overlay=0:0:enable='between(t,{clip.tl_start},{clip.tl_end})'"
-            f"[{comp_label}]"
-        )
-        filter_parts.append(overlay_filter)
-        current_label = comp_label
-
-    # Finally overlay the above-video SVG PNG (with alpha) on top of everything
-    final_label = "final_out"
-    filter_parts.append(
-        f"[{current_label}][1:v]overlay=0:0:format=auto[{final_label}]"
-    )
-
+    final_label = current_label
     filter_complex = ";".join(filter_parts)
 
     intermediate = job_dir / "composited_intermediate.mp4"
@@ -1212,19 +1229,37 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
     stage_h    = payload.get("stageHeight", 1080)
     total_frames = max(1, math.ceil((end_time - start_time) * fps))
 
-    # Detect whether there are any video nodes in this project, and if so
-    # collect their node-div IDs for the layer-mode API in QweenRender.html.
-    # We need this before launching Playwright so we know whether to do
-    # single-pass (no video) or three-pass (with video) rendering.
+    # Detect video nodes and their z-order. QweenRender.html assigns each
+    # top-level node a DOM zIndex of (index-in-project.nodes + 2) — see
+    # buildDom() — so we can derive z purely from list position without a
+    # round-trip through the page. Sorting these gives the stacking order of
+    # every video layer, which is what lets us support more than one video
+    # (or a layer sandwiched between two videos) instead of a single fixed
+    # below/above split.
     nodes_in_payload = payload.get("nodes", [])
-    video_node_ids = [n["id"] for n in nodes_in_payload if n.get("type") == "video"]
-    has_video_nodes = bool(video_node_ids)
+    video_node_entries = sorted(
+        (
+            {"id": n.get("id"), "z": i + 2}
+            for i, n in enumerate(nodes_in_payload)
+            if n.get("type") == "video"
+        ),
+        key=lambda e: e["z"],
+    )
+    video_node_ids = [e["id"] for e in video_node_entries]
+    video_zs       = [e["z"] for e in video_node_entries]
+    has_video_nodes = bool(video_node_entries)
 
-    frames_below_dir = job_dir / "frames_below"  # below-video SVG layers (transparent bg)
-    frames_above_dir = job_dir / "frames_above"  # above-video SVG layers (transparent bg)
+    # One transparent SVG "band" per gap between (and around) the stacked
+    # video nodes — len(video_zs) + 1 bands total. With a single video this
+    # is just the old below/above pair; with N videos it generalizes to N+1
+    # bands so a layer sandwiched between two videos still gets its own pass
+    # instead of disappearing.
+    frames_band_dirs: list[Path] = []
     if has_video_nodes:
-        frames_below_dir.mkdir(exist_ok=True)
-        frames_above_dir.mkdir(exist_ok=True)
+        for b in range(len(video_zs) + 1):
+            band_dir = job_dir / f"frames_band{b}"
+            band_dir.mkdir(exist_ok=True)
+            frames_band_dirs.append(band_dir)
 
     async def _render():
         # Rebuild the project ZIP from the already-remapped payload so QweenRender
@@ -1266,17 +1301,19 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
                 await page.goto(render_url, wait_until="networkidle", timeout=60_000)
                 await page.wait_for_function("window.__qween_ready === true", timeout=120_000)
 
+                total_passes = (1 + len(frames_band_dirs)) if has_video_nodes else 1
+
                 # ── Pass 1: normal render (all nodes visible) ──────────────────
                 # SVG layers paint correctly; video nodes paint as opaque black.
                 # We only use this pass when there are no video nodes, OR as a
                 # fallback.  When video nodes exist we skip this pass and use
-                # the below/above passes instead, which give us transparent PNGs
-                # we can sandwich around the FFmpeg video.
+                # the band passes instead, which give us transparent PNGs we
+                # can sandwich around the FFmpeg video(s).
                 # We still run pass 1 so callers get frames_dir populated even
                 # if compositing later fails (graceful fallback).
                 await page.evaluate(
-                    "(ids) => window.__qween_set_layer_mode && window.__qween_set_layer_mode('normal', ids)",
-                    video_node_ids,
+                    "(mode) => window.__qween_set_layer_mode && window.__qween_set_layer_mode(mode, null, null)",
+                    "normal",
                 )
                 for i in range(total_frames):
                     t = start_time + (i / fps)
@@ -1287,49 +1324,40 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
                         clip={"x": 0, "y": 0, "width": stage_w, "height": stage_h},
                     )
                     _job_update(job_id, progress=int((i + 1) / total_frames * 24),
-                                 message=f"Pass 1/3 — frame {i+1}/{total_frames}")
+                                 message=f"Pass 1/{total_passes} — frame {i+1}/{total_frames}")
 
                 if has_video_nodes:
-                    # ── Pass 2: below-video nodes only, transparent background ──
-                    # Shows only SVG/text nodes whose DOM zIndex is below every
-                    # video node.  PNG alpha channel is preserved (omit -pix_fmt).
-                    await page.evaluate(
-                        "(ids) => window.__qween_set_layer_mode('below_video', ids)",
-                        video_node_ids,
-                    )
-                    for i in range(total_frames):
-                        t = start_time + (i / fps)
-                        await page.evaluate("async (t) => { await window.__qween_seek(t); }", t)
-                        await page.wait_for_function("window.__qween_frame_ready === true", timeout=30_000)
-                        await page.screenshot(
-                            path=str(frames_below_dir / f"frame_{i:06d}.png"),
-                            clip={"x": 0, "y": 0, "width": stage_w, "height": stage_h},
-                            omit_background=True,
+                    # ── Pass 2…N+1: one transparent band per gap between the
+                    # stacked video nodes (band 0 = below the lowest video,
+                    # band N = above the highest, with any in-between bands
+                    # for layers sandwiched between two videos).
+                    band_count = len(frames_band_dirs)
+                    band_span  = 48  # progress points 24→72, same budget the old 2-pass version used
+                    for b, band_dir in enumerate(frames_band_dirs):
+                        z_min = video_zs[b - 1] if b > 0 else None
+                        z_max = video_zs[b] if b < len(video_zs) else None
+                        await page.evaluate(
+                            "([zMin, zMax]) => window.__qween_set_layer_mode('band', zMin, zMax)",
+                            [z_min, z_max],
                         )
-                        _job_update(job_id, progress=24 + int((i + 1) / total_frames * 24),
-                                     message=f"Pass 2/3 — frame {i+1}/{total_frames}")
-
-                    # ── Pass 3: above-video nodes only, transparent background ──
-                    await page.evaluate(
-                        "(ids) => window.__qween_set_layer_mode('above_video', ids)",
-                        video_node_ids,
-                    )
-                    for i in range(total_frames):
-                        t = start_time + (i / fps)
-                        await page.evaluate("async (t) => { await window.__qween_seek(t); }", t)
-                        await page.wait_for_function("window.__qween_frame_ready === true", timeout=30_000)
-                        await page.screenshot(
-                            path=str(frames_above_dir / f"frame_{i:06d}.png"),
-                            clip={"x": 0, "y": 0, "width": stage_w, "height": stage_h},
-                            omit_background=True,
-                        )
-                        _job_update(job_id, progress=48 + int((i + 1) / total_frames * 24),
-                                     message=f"Pass 3/3 — frame {i+1}/{total_frames}")
+                        for i in range(total_frames):
+                            t = start_time + (i / fps)
+                            await page.evaluate("async (t) => { await window.__qween_seek(t); }", t)
+                            await page.wait_for_function("window.__qween_frame_ready === true", timeout=30_000)
+                            await page.screenshot(
+                                path=str(band_dir / f"frame_{i:06d}.png"),
+                                clip={"x": 0, "y": 0, "width": stage_w, "height": stage_h},
+                                omit_background=True,
+                            )
+                            per_band = band_span / band_count
+                            progress = 24 + int(b * per_band + (i + 1) / total_frames * per_band)
+                            _job_update(job_id, progress=progress,
+                                         message=f"Pass {b+2}/{total_passes} — frame {i+1}/{total_frames}")
 
                     # Restore normal mode (good practice even though page closes next)
                     await page.evaluate(
-                        "(ids) => window.__qween_set_layer_mode('normal', ids)",
-                        video_node_ids,
+                        "(mode) => window.__qween_set_layer_mode && window.__qween_set_layer_mode(mode, null, null)",
+                        "normal",
                     )
 
             finally:
@@ -1340,14 +1368,15 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
     asyncio.run(_render())
 
     # ── Option-B: composite video layers with correct z-ordering ──────────────
-    # Three-layer composite: [below-video SVGs] → [video] → [above-video SVGs]
-    # The below/above PNG sequences have transparent backgrounds so they can be
-    # overlaid without clobbering each other.
+    # N-band composite: [band 0] → [video 0's clips] → [band 1] → [video 1's
+    # clips] → … → [band N]. Each band PNG sequence has a transparent
+    # background so they can be alpha-overlaid without clobbering the layers
+    # below them.
     _job_update(job_id, status="processing", message="Compositing video layers…", progress=74)
     stitch_dir = _composite_video_layers(
         job_id, job_dir, frames_dir, payload, fps, total_frames,
-        frames_below_dir=frames_below_dir if has_video_nodes else None,
-        frames_above_dir=frames_above_dir if has_video_nodes else None,
+        frames_band_dirs=frames_band_dirs if has_video_nodes else None,
+        video_node_order=video_node_ids if has_video_nodes else None,
     )
 
     _job_update(job_id, status="processing", message="Stitching frames…", progress=84)

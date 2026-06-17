@@ -1288,44 +1288,41 @@ async function run() {
     window.__qween_frame_ready = false;
     window.__qween_master_tl   = null;
 
-    // __qween_set_layer_mode(mode, videoNodeIds)
+    // __qween_set_layer_mode(mode, zMin, zMax)
     // Used by the Python renderer for multi-pass video compositing.
+    //
+    // Earlier versions split nodes into two fixed buckets ("below the lowest
+    // video" / "above the highest video"), which broke as soon as there was
+    // more than one video node or a layer sandwiched between two videos —
+    // that middle layer satisfied neither bucket and simply never rendered.
+    //
+    // This version works in terms of an explicit z-index band instead: only
+    // nodes whose DOM zIndex falls strictly between zMin and zMax are shown.
+    // The Python side derives zMin/zMax for every gap between (and around)
+    // the stacked video nodes — see _run_playwright_render — so an arbitrary
+    // number of videos, in any order, each get their own band on either side.
+    //
     // mode:
-    //   'normal'       — all nodes visible, opaque black background (default)
-    //   'below_video'  — only nodes whose DOM zIndex is BELOW the lowest video node;
-    //                    body/html background set transparent for PNG alpha capture
-    //   'above_video'  — only nodes whose DOM zIndex is ABOVE the highest video node;
-    //                    body/html background set transparent for PNG alpha capture
-    // videoNodeIds: array of node div IDs that are video nodes (e.g. ['node-2'])
-    window.__qween_set_layer_mode = function(mode, videoNodeIds) {
+    //   'normal' — all nodes visible, opaque black background (default)
+    //   'band'   — only nodes with zMin < zIndex < zMax visible;
+    //              body/html background set transparent for PNG alpha capture
+    // zMin / zMax: pass null for an open-ended bound, e.g. zMin=null means
+    //              "everything below zMax" (the lowest band has no floor).
+    window.__qween_set_layer_mode = function(mode, zMin, zMax) {
       const nodeEls = Array.from(document.querySelectorAll('.qw-node'));
-
-      // Collect video node zIndexes
-      const videoZIndexes = (videoNodeIds || [])
-        .map(id => document.getElementById(id))
-        .filter(Boolean)
-        .map(el => parseInt(el.style.zIndex, 10) || 0);
-
-      const minVideoZ = videoZIndexes.length ? Math.min(...videoZIndexes) : Infinity;
-      const maxVideoZ = videoZIndexes.length ? Math.max(...videoZIndexes) : -Infinity;
 
       if (mode === 'normal') {
         document.documentElement.style.background = '';
         document.body.style.background = '';
         nodeEls.forEach(el => { el.style.visibility = ''; });
-      } else if (mode === 'below_video') {
+      } else if (mode === 'band') {
+        const lo = (zMin === null || zMin === undefined) ? -Infinity : zMin;
+        const hi = (zMax === null || zMax === undefined) ? Infinity : zMax;
         document.documentElement.style.background = 'transparent';
         document.body.style.background = 'transparent';
         nodeEls.forEach(el => {
           const z = parseInt(el.style.zIndex, 10) || 0;
-          el.style.visibility = z < minVideoZ ? 'visible' : 'hidden';
-        });
-      } else if (mode === 'above_video') {
-        document.documentElement.style.background = 'transparent';
-        document.body.style.background = 'transparent';
-        nodeEls.forEach(el => {
-          const z = parseInt(el.style.zIndex, 10) || 0;
-          el.style.visibility = z > maxVideoZ ? 'visible' : 'hidden';
+          el.style.visibility = (z > lo && z < hi) ? 'visible' : 'hidden';
         });
       }
     };
