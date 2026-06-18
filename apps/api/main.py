@@ -604,6 +604,12 @@ async def merge_videos(
 @app.get("/jobs/{job_id}/download")
 def download(job_id: str):
     job_dir = WORK_DIR / job_id
+    # PNG sequence export
+    png_zip = job_dir / "output.zip"
+    if png_zip.exists():
+        return FileResponse(png_zip, media_type="application/zip",
+                            filename=f"qween_{job_id[:8]}_frames.zip")
+    # Video outputs
     for fmt, cfg in FORMAT_CONFIG.items():
         p = job_dir / f"output{cfg['ext']}"
         if p.exists():
@@ -1257,7 +1263,7 @@ def _composite_video_layers(
 
 
 def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
-                            fps: float, crf: int):
+                            fps: float, crf: int, output_mode: str = "video"):
     import asyncio
     from playwright.async_api import async_playwright
 
@@ -1446,6 +1452,28 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
         video_node_order=video_node_ids if has_video_nodes else None,
     )
 
+    if output_mode == "png_sequence":
+        # ── PNG Sequence export: zip stitch_dir and store as output.zip ────────
+        _job_update(job_id, status="processing", message="Packaging PNG sequence…", progress=84)
+        output_zip = job_dir / "output.zip"
+        frames = sorted(stitch_dir.glob("frame_*.png"))
+        with zipfile.ZipFile(output_zip, "w", zipfile.ZIP_STORED) as zf:
+            for i, f in enumerate(frames):
+                zf.write(f, f.name)
+                if i % 20 == 0:
+                    pct = 84 + int((i / max(len(frames), 1)) * 14)
+                    _job_update(job_id, progress=pct)
+        mb = round(output_zip.stat().st_size / 1_048_576, 2)
+        _job_update(job_id, status="done",
+                    message=f"Done — {len(frames)} frames · {mb} MB",
+                    progress=100, size_mb=mb, format="png_sequence",
+                    frame_count=len(frames))
+        with _meta_lock:
+            if job_id in _job_meta:
+                _job_meta[job_id].update({"has_output": True, "format": "png_sequence", "size_mb": mb})
+        return
+
+    # ── Video output (default) ─────────────────────────────────────────────────
     _job_update(job_id, status="processing", message="Stitching frames…", progress=84)
 
     output = output_path_for(job_dir, fmt)
@@ -1472,9 +1500,9 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
 
 
 def _run_playwright_render_safe(job_id: str, job_dir: Path, payload: dict, fmt: str,
-                                 fps: float, crf: int):
+                                 fps: float, crf: int, output_mode: str = "video"):
     try:
-        _run_playwright_render(job_id, job_dir, payload, fmt, fps, crf)
+        _run_playwright_render(job_id, job_dir, payload, fmt, fps, crf, output_mode=output_mode)
     except Exception as e:
         _job_update(job_id, status="error", message=str(e), progress=0)
     finally:
@@ -1908,6 +1936,38 @@ async def playwright_render(req: PlaywrightRenderRequest, background_tasks: Back
     t = threading.Thread(
         target=_run_playwright_render_safe,
         args=(job_id, job_dir, payload, fmt, req.fps, req.crf),
+        daemon=True,
+    )
+    t.start()
+
+    return {"job_id": job_id, "status": "queued", "poll_url": f"/jobs/{job_id}/status"}
+
+
+# ── /jobs/render-png-sequence ─────────────────────────────────────────────────
+# Same payload as /jobs/playwright-render but outputs a ZIP of PNG frames
+# instead of a stitched video. Skips FFmpeg entirely — Playwright frames are
+# composited (if video nodes present) then zipped and stored for download.
+@app.post("/jobs/render-png-sequence")
+async def render_png_sequence(req: PlaywrightRenderRequest, background_tasks: BackgroundTasks):
+    if req.endTime <= req.startTime:
+        raise HTTPException(400, "endTime must be greater than startTime.")
+
+    job_id, job_dir = new_job(label="render-png-sequence")
+    _job_init(job_id, label="render-png-sequence")
+
+    payload = req.model_dump()
+    _remap_payload_for_render(payload)
+
+    import io as _io
+    zip_buf = _io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("project.json", json.dumps(payload))
+    payload["_project_zip"] = zip_buf.getvalue()
+
+    t = threading.Thread(
+        target=_run_playwright_render_safe,
+        args=(job_id, job_dir, payload, "mp4", req.fps, req.crf),
+        kwargs={"output_mode": "png_sequence"},
         daemon=True,
     )
     t.start()
