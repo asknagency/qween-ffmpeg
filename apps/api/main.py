@@ -31,8 +31,8 @@ AUTO_CLEAN_HOURS = 6
 
 # ── Format config ─────────────────────────────────────────────────────────────
 FORMAT_CONFIG = {
-    "mp4":  {"ext": ".mp4",  "mime": "video/mp4",      "codec_args": ["-c:v", "libx264", "-pix_fmt", "yuv420p"]},
-    "mov":  {"ext": ".mov",  "mime": "video/quicktime", "codec_args": ["-c:v", "libx264", "-pix_fmt", "yuv420p"]},
+    "mp4":  {"ext": ".mp4",  "mime": "video/mp4",      "codec_args": ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-tune", "animation", "-movflags", "+faststart"]},
+    "mov":  {"ext": ".mov",  "mime": "video/quicktime", "codec_args": ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-tune", "animation", "-movflags", "+faststart"]},
     "webm": {"ext": ".webm", "mime": "video/webm",      "codec_args": ["-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-auto-alt-ref", "0"]},
     "gif":  {"ext": ".gif",  "mime": "image/gif",       "codec_args": []},
 }
@@ -158,6 +158,45 @@ def run_ffmpeg_queued(args: list[str], cwd: Path | None = None) -> tuple[int, st
     """Same as run_ffmpeg but acquires the CPU semaphore first."""
     with _ffmpeg_sem:
         return run_ffmpeg(args, cwd)
+
+def run_ffmpeg_with_progress(args: list[str], job_id: str,
+                              total_frames: int,
+                              progress_start: int = 0, progress_end: int = 100,
+                              cwd: Path | None = None) -> tuple[int, str, str]:
+    """Run ffmpeg with real per-frame progress updates via -progress pipe:1."""
+    full_args = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats", *args]
+    proc = subprocess.Popen(
+        full_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, cwd=str(cwd) if cwd else None,
+    )
+    stdout_lines: list[str] = []
+    stderr_buf = ""
+    while True:
+        line = proc.stdout.readline()
+        if not line and proc.poll() is not None:
+            break
+        line = line.strip()
+        if not line:
+            continue
+        stdout_lines.append(line)
+        if line.startswith("frame=") and total_frames > 0:
+            try:
+                frame_n = int(line.split("=")[1].strip())
+                pct = progress_start + int((frame_n / total_frames) * (progress_end - progress_start))
+                _job_update(job_id, progress=min(pct, progress_end))
+            except (ValueError, IndexError):
+                pass
+    stderr_buf = proc.stderr.read()
+    proc.wait()
+    return proc.returncode, "\n".join(stdout_lines), stderr_buf
+
+def run_ffmpeg_with_progress_queued(args: list[str], job_id: str,
+                                     total_frames: int,
+                                     progress_start: int = 0, progress_end: int = 100,
+                                     cwd: Path | None = None) -> tuple[int, str, str]:
+    """Queued version of run_ffmpeg_with_progress."""
+    with _ffmpeg_sem:
+        return run_ffmpeg_with_progress(args, job_id, total_frames, progress_start, progress_end, cwd)
 
 def cleanup_job(job_dir: Path):
     shutil.rmtree(job_dir, ignore_errors=True)
@@ -327,10 +366,10 @@ async def upload_video(file: UploadFile = File(...)):
     raw_path   = job_dir / f"raw{suffix}"
     video_path = job_dir / f"input{suffix}"
     async with aiofiles.open(raw_path, "wb") as f: await f.write(data)
-    code, _, err = run_ffmpeg(["-i", str(raw_path), "-c", "copy",
+    code, _, err = run_ffmpeg_queued(["-i", str(raw_path), "-c", "copy",
                                "-movflags", "faststart", str(video_path)])
     if code != 0:
-        code, _, err = run_ffmpeg(["-i", str(raw_path), "-c:v", "libx264",
+        code, _, err = run_ffmpeg_queued(["-i", str(raw_path), "-c:v", "libx264",
                                    "-crf", "18", "-preset", "fast",
                                    "-movflags", "faststart", str(video_path)])
     if code != 0:
@@ -358,6 +397,9 @@ def _run_stitch(job_id: str, job_dir: Path, input_pattern: str, img_ext: str,
     output = output_path_for(job_dir, fmt)
     try:
         _job_update(job_id, status="processing", message="Stitching frames…", progress=10)
+        # Estimate total frames for real progress reporting
+        flat_dir = job_dir / "flat"
+        _total_frames = len(list(flat_dir.iterdir())) if flat_dir.exists() else 0
         if fmt == "gif":
             code, err = stitch_to_gif(input_pattern, fps, job_dir, output, vf)
         else:
@@ -366,12 +408,13 @@ def _run_stitch(job_id: str, job_dir: Path, input_pattern: str, img_ext: str,
             if trim_start is not None: args += ["-ss", str(trim_start)]
             if trim_end   is not None: args += ["-to", str(trim_end)]
             args += cfg["codec_args"]
-            if fmt in ("mp4", "mov"): args += ["-crf", str(crf), "-preset", preset]
+            if fmt in ("mp4", "mov"): args += ["-crf", str(crf), "-preset", preset, "-g", str(int(fps * 2))]
             elif fmt == "webm":       args += ["-crf", str(crf), "-b:v", "0"]
             if vf: args += ["-vf", vf]
             args += [str(output)]
-            _job_update(job_id, progress=20)
-            code, _, err = run_ffmpeg_queued(args)
+            code, _, err = run_ffmpeg_with_progress_queued(
+                args, job_id, _total_frames, progress_start=10, progress_end=99
+            )
         if code != 0:
             raise RuntimeError(friendly_ffmpeg_error(err))
         mb = round(output.stat().st_size / 1_048_576, 2)
@@ -518,11 +561,11 @@ async def merge_videos(
                 fixed  = inputs_dir / f"clip_{i:03d}.mp4"
                 # Already read above; write synchronously inside thread
                 raw.write_bytes(f._body)  # stashed below
-                code, _, err = run_ffmpeg(["-i", str(raw), "-c", "copy",
+                code, _, err = run_ffmpeg_queued(["-i", str(raw), "-c", "copy",
                                            "-movflags", "faststart", str(fixed)])
                 if code != 0:
-                    code, _, err = run_ffmpeg(["-i", str(raw), "-c:v", "libx264",
-                                               "-crf", "18", "-preset", "fast",
+                    code, _, err = run_ffmpeg_queued(["-i", str(raw), "-c:v", "libx264",
+                                               "-crf", "-preset", "fast",
                                                "-movflags", "faststart", str(fixed)])
                 if code != 0:
                     raise RuntimeError(f"Could not process clip {i+1}: {friendly_ffmpeg_error(err)}")
@@ -1178,12 +1221,13 @@ def _composite_video_layers(
     final_label = current_label
     filter_complex = ";".join(filter_parts)
 
-    intermediate = job_dir / "composited_intermediate.mp4"
+    # Direct composite → PNG sequence, no intermediate video encode.
+    # Avoids double-encode generation loss (old: MP4 CRF0 → explode → re-stitch).
     comp_args = (
         ffmpeg_inputs
         + ["-filter_complex", filter_complex, "-map", f"[{final_label}]"]
-        + ["-c:v", "libx264", "-crf", "0", "-preset", "ultrafast", "-pix_fmt", "yuv444p"]
-        + [str(intermediate)]
+        + ["-vsync", "0"]
+        + [str(comp_dir / "frame_%06d.png")]
     )
     code, _, err = run_ffmpeg_queued(comp_args)
     if code != 0:
@@ -1191,19 +1235,6 @@ def _composite_video_layers(
         print(f"[QweenFFmpeg] Video composite failed for job {job_id}: {err}", file=sys.stderr)
         return frames_dir  # fall back to original Playwright frames
 
-    # Explode intermediate back to PNGs for the stitch step
-    explode_args = [
-        "-i", str(intermediate),
-        "-vsync", "0",
-        str(comp_dir / "frame_%06d.png"),
-    ]
-    code2, _, err2 = run_ffmpeg_queued(explode_args)
-    if code2 != 0:
-        import sys
-        print(f"[QweenFFmpeg] Frame explode failed for job {job_id}: {err2}", file=sys.stderr)
-        return frames_dir
-
-    intermediate.unlink(missing_ok=True)
     return comp_dir
 
 
@@ -1388,10 +1419,13 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
         code, err = stitch_to_gif(input_pattern, fps, job_dir, output)
     else:
         args = ["-framerate", str(fps), "-i", input_pattern, *cfg["codec_args"]]
-        if fmt in ("mp4", "mov"): args += ["-crf", str(crf), "-preset", "medium"]
-        elif fmt == "webm":       args += ["-crf", str(crf), "-b:v", "0"]
+        if fmt in ("mp4", "mov"): args += ["-crf", str(crf), "-preset", "medium", "-g", str(int(fps * 2)), "-an"]
+        elif fmt == "webm":       args += ["-crf", str(crf), "-b:v", "0", "-an"]
         args += [str(output)]
-        code, _, err = run_ffmpeg_queued(args)
+        # Use real per-frame progress (84→99)
+        code, _, err = run_ffmpeg_with_progress_queued(
+            args, job_id, total_frames, progress_start=84, progress_end=99
+        )
 
     if code != 0:
         raise RuntimeError(friendly_ffmpeg_error(err))
