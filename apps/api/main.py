@@ -1171,9 +1171,27 @@ def _composite_video_layers(
     comp_dir = job_dir / "frames_comp"
     comp_dir.mkdir(exist_ok=True)
 
+    # Strategy 5: some bands may not have been captured (empty outermost bands
+    # where video is top/bottom layer).  For any missing band dir, substitute a
+    # single transparent 1×1 PNG with a lavfi color=black@0 source so the
+    # filter_complex index mapping stays consistent without adding real I/O cost.
+    import sys as _sys
+    _blank_png = job_dir / "blank_band.png"
+    if not _blank_png.exists():
+        _blank_code, _, _blank_err = run_ffmpeg(
+            ["-f", "lavfi", "-i", f"color=black@0:size={payload.get('stageWidth',1920)}x{payload.get('stageHeight',1080)}:rate=1",
+             "-frames:v", "1", str(_blank_png)]
+        )
+        if _blank_code != 0:
+            print(f"[QweenFFmpeg] Could not create blank band PNG: {_blank_err}", file=_sys.stderr)
+
     ffmpeg_inputs: list[str] = []
     for band_dir in frames_band_dirs:
-        ffmpeg_inputs += ["-framerate", str(fps), "-i", str(band_dir / "frame_%06d.png")]
+        if band_dir.exists() and any(band_dir.iterdir()):
+            ffmpeg_inputs += ["-framerate", str(fps), "-i", str(band_dir / "frame_%06d.png")]
+        else:
+            # Empty/skipped band — loop the blank transparent frame
+            ffmpeg_inputs += ["-loop", "1", "-i", str(_blank_png)]
     clip_input_base = len(frames_band_dirs)
     for clip in clips:
         ffmpeg_inputs += ["-i", str(clip.asset_path)]
@@ -1332,60 +1350,78 @@ def _run_playwright_render(job_id: str, job_dir: Path, payload: dict, fmt: str,
                 await page.goto(render_url, wait_until="networkidle", timeout=60_000)
                 await page.wait_for_function("window.__qween_ready === true", timeout=120_000)
 
-                total_passes = (1 + len(frames_band_dirs)) if has_video_nodes else 1
-
-                # ── Pass 1: normal render (all nodes visible) ──────────────────
-                # SVG layers paint correctly; video nodes paint as opaque black.
-                # We only use this pass when there are no video nodes, OR as a
-                # fallback.  When video nodes exist we skip this pass and use
-                # the band passes instead, which give us transparent PNGs we
-                # can sandwich around the FFmpeg video(s).
-                # We still run pass 1 so callers get frames_dir populated even
-                # if compositing later fails (graceful fallback).
-                await page.evaluate(
-                    "(mode) => window.__qween_set_layer_mode && window.__qween_set_layer_mode(mode, null, null)",
-                    "normal",
+                # ── Strategy 5: detect bands that are empty (outermost when
+                # video is the top or bottom node) and skip them.
+                # band 0  = below lowest video  → skip if no SVG nodes below it
+                # band[-1]= above highest video → skip if no SVG nodes above it
+                all_non_video_zs = sorted(
+                    i + 2 for i, n in enumerate(nodes_in_payload)
+                    if n.get("type") != "video"
                 )
-                for i in range(total_frames):
-                    t = start_time + (i / fps)
-                    await page.evaluate("async (t) => { await window.__qween_seek(t); }", t)
-                    await page.wait_for_function("window.__qween_frame_ready === true", timeout=30_000)
-                    await page.screenshot(
-                        path=str(frames_dir / f"frame_{i:06d}.png"),
-                        clip={"x": 0, "y": 0, "width": stage_w, "height": stage_h},
-                    )
-                    _job_update(job_id, progress=int((i + 1) / total_frames * 24),
-                                 message=f"Pass 1/{total_passes} — frame {i+1}/{total_frames}")
+                lowest_video_z  = video_zs[0]  if video_zs else None
+                highest_video_z = video_zs[-1] if video_zs else None
+                skip_bottom_band = has_video_nodes and (
+                    not any(z < lowest_video_z for z in all_non_video_zs)
+                )
+                skip_top_band = has_video_nodes and (
+                    not any(z > highest_video_z for z in all_non_video_zs)
+                )
 
+                active_bands: list[tuple[int, Path]] = []
                 if has_video_nodes:
-                    # ── Pass 2…N+1: one transparent band per gap between the
-                    # stacked video nodes (band 0 = below the lowest video,
-                    # band N = above the highest, with any in-between bands
-                    # for layers sandwiched between two videos).
-                    band_count = len(frames_band_dirs)
-                    band_span  = 48  # progress points 24→72, same budget the old 2-pass version used
                     for b, band_dir in enumerate(frames_band_dirs):
-                        z_min = video_zs[b - 1] if b > 0 else None
-                        z_max = video_zs[b] if b < len(video_zs) else None
-                        await page.evaluate(
-                            "([zMin, zMax]) => window.__qween_set_layer_mode('band', zMin, zMax)",
-                            [z_min, z_max],
+                        if b == 0 and skip_bottom_band:
+                            continue  # Strategy 5: video is lowest layer — no SVG below
+                        if b == len(frames_band_dirs) - 1 and skip_top_band:
+                            continue  # Strategy 5: video is highest layer — no SVG above
+                        active_bands.append((b, band_dir))
+
+                if not has_video_nodes:
+                    # ── No video nodes: single normal pass ────────────────────
+                    await page.evaluate(
+                        "(mode) => window.__qween_set_layer_mode && window.__qween_set_layer_mode(mode, null, null)",
+                        "normal",
+                    )
+                    for i in range(total_frames):
+                        t = start_time + (i / fps)
+                        await page.evaluate("async (t) => { await window.__qween_seek(t); }", t)
+                        await page.wait_for_function("window.__qween_frame_ready === true", timeout=30_000)
+                        await page.screenshot(
+                            path=str(frames_dir / f"frame_{i:06d}.png"),
+                            clip={"x": 0, "y": 0, "width": stage_w, "height": stage_h},
                         )
-                        for i in range(total_frames):
-                            t = start_time + (i / fps)
-                            await page.evaluate("async (t) => { await window.__qween_seek(t); }", t)
-                            await page.wait_for_function("window.__qween_frame_ready === true", timeout=30_000)
+                        _job_update(job_id, progress=int((i + 1) / total_frames * 72),
+                                     message=f"Rendering frame {i+1}/{total_frames}")
+                else:
+                    # ── Strategy 1: skip Pass 1 entirely when video nodes exist.
+                    # Strategy 2: seek ONCE per frame, capture all active bands
+                    # before advancing — eliminates (N_bands - 1) extra seeks per
+                    # frame compared to the original per-band outer loop.
+                    band_count   = len(active_bands)
+                    total_passes = band_count  # for progress label
+                    for i in range(total_frames):
+                        t = start_time + (i / fps)
+                        await page.evaluate("async (t) => { await window.__qween_seek(t); }", t)
+                        await page.wait_for_function("window.__qween_frame_ready === true", timeout=30_000)
+
+                        for pass_idx, (b, band_dir) in enumerate(active_bands):
+                            z_min = video_zs[b - 1] if b > 0 else None
+                            z_max = video_zs[b] if b < len(video_zs) else None
+                            await page.evaluate(
+                                "([zMin, zMax]) => window.__qween_set_layer_mode('band', zMin, zMax)",
+                                [z_min, z_max],
+                            )
                             await page.screenshot(
                                 path=str(band_dir / f"frame_{i:06d}.png"),
                                 clip={"x": 0, "y": 0, "width": stage_w, "height": stage_h},
                                 omit_background=True,
                             )
-                            per_band = band_span / band_count
-                            progress = 24 + int(b * per_band + (i + 1) / total_frames * per_band)
-                            _job_update(job_id, progress=progress,
-                                         message=f"Pass {b+2}/{total_passes} — frame {i+1}/{total_frames}")
 
-                    # Restore normal mode (good practice even though page closes next)
+                        progress = int((i + 1) / total_frames * 72)
+                        _job_update(job_id, progress=progress,
+                                     message=f"Rendering frame {i+1}/{total_frames} ({band_count} band{'s' if band_count != 1 else ''})")
+
+                    # Restore normal mode
                     await page.evaluate(
                         "(mode) => window.__qween_set_layer_mode && window.__qween_set_layer_mode(mode, null, null)",
                         "normal",
