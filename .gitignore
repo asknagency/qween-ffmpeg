@@ -27,10 +27,13 @@ env/
 .DS_Store
 Thumbbs.db
 
-# Env
+# Env — ignore all .env files but keep .env.example templates
 .env
 .env.local
 .env.production
+apps/api/.env
+apps/web/.env.local
+!**/.env.example
 
 # pnpm
 .pnpm-store/

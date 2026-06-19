@@ -22,8 +22,16 @@
       "command": "cd apps/api && python -m playwright install chromium --with-deps"
     },
     {
-      "name": "Create .env",
+      "name": "Create root .env",
       "command": "[ -f .env ] || cp .env.example .env"
+    },
+    {
+      "name": "Create API .env",
+      "command": "[ -f apps/api/.env ] || cp apps/api/.env.example apps/api/.env"
+    },
+    {
+      "name": "Create Web .env.local",
+      "command": "[ -f apps/web/.env.local ] || cp apps/web/.env.example apps/web/.env.local"
     }
   ],
   "tasks": {
