@@ -11,7 +11,7 @@ import RecentTool  from '@/tools/RecentTool'
 import { StorageBadge } from '@/components/ui'
 import { getStorage, cleanAllJobs } from '@/lib/api'
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '/api/ffmpeg'
 
 const TABS = [
   { id: 'stitch',  label: 'Stitch',  desc: 'Frames → Video' },
