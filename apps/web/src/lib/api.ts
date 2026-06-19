@@ -1,4 +1,4 @@
-const DEFAULT_BASE = 'http://localhost:8000'
+const DEFAULT_BASE = process.env.NEXT_PUBLIC_API_URL ?? '/api/ffmpeg'
 
 export type OutputFormat = 'mp4' | 'mov' | 'webm' | 'gif'
 export type VideoFormat  = 'mp4' | 'mov' | 'webm'
