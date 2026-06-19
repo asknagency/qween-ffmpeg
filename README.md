@@ -39,7 +39,6 @@ User exports project.zip from QweenApp
 # Clone and install everything
 git clone https://github.com/your-org/qween.git
 cd qween
-cp .env.example .env
 
 # Install Node deps (web + app)
 pnpm install
@@ -142,10 +141,22 @@ copied from QweenApp. When QweenApp's animation engine changes:
 
 ## Environment variables
 
-Copy `.env.example` to `.env` and adjust:
+### Configure env files (required before first run)
 
-```env
-PORT=8000           # FastAPI port
-RENDERER_PORT=3000  # Node renderer port
-NEXT_PUBLIC_API_URL=http://localhost:8000
+Copy each `.env.example` to `.env` and fill in values for your environment:
+
+```bash
+# Root
+cp .env.example .env
+
+# Per-app
+cp apps/api/.env.example apps/api/.env
+cp apps/web/.env.example apps/web/.env
 ```
+
+| File | Key variables |
+|------|---------------|
+| `.env` / `apps/api/.env` | `PORT=8000`, `RENDERER_PORT=3000`, `CORS_ORIGINS`, `WORK_DIR`, `ASSETS_DIR` |
+| `apps/web/.env` | `NEXT_PUBLIC_API_URL=http://localhost:8000` |
+
+Update these values whenever you change ports, deploy to a new host, or reconfigure storage paths.
